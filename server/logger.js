@@ -1,6 +1,8 @@
 const redact = (value) => String(value)
   .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, '[email ocultado]')
+  .replace(/\b(?:postgres(?:ql)?|mysql|redis):\/\/[^\s"'<>]+/gi, '[string de conexão ocultada]')
   .replace(/\b(?:sb_(?:secret|publishable)_|sk-ant-)[A-Za-z0-9_-]+\b/g, '[chave ocultada]')
+  .replace(/\b(SUPABASE_(?:SECRET|ANON)_KEY|DATABASE_URL|CONNECTION_STRING)(["'\s:=]+)[^\s,;]+/gi, '$1$2[valor ocultado]')
   .replace(/\b(password|pin|token|authorization|cookie)(["'\s:=]+)[^\s,;]+/gi, '$1$2[valor ocultado]')
   .replace(/\b[A-Za-z0-9_-]{40,}\b/g, '[token ocultado]')
   .replace(/\b\d{10,15}\b/g, '[número ocultado]')

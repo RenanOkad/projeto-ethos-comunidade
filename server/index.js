@@ -11,7 +11,7 @@ const app = express()
 const port = Number(process.env.PORT || 3001)
 const production = process.env.NODE_ENV === 'production'
 const appUrl = process.env.APP_URL || 'http://localhost:5173'
-const configuredOrigin = new URL(appUrl).origin
+const configuredOrigin = production ? '' : new URL(appUrl).origin
 const SESSION_DAYS = 365
 function requestPath(req) {
   const route = req.route?.path
@@ -59,7 +59,8 @@ app.use((req, res, next) => {
     const isLocalDevelopmentOrigin = !production &&
       requestOrigin.protocol === 'http:' &&
       ['localhost', '127.0.0.1', '[::1]'].includes(requestOrigin.hostname)
-    if (requestOrigin.origin !== configuredOrigin && !isLocalDevelopmentOrigin) {
+    const expectedOrigin = production ? `${req.protocol}://${req.get('host')}` : configuredOrigin
+    if (requestOrigin.origin !== expectedOrigin && !isLocalDevelopmentOrigin) {
       return res.status(403).json({ error: 'Origem não permitida.' })
     }
   }
@@ -172,7 +173,13 @@ const clearBadLogin = (keys) => rpc('clear_login_failures', { p_attempt_keys: ke
 
 app.get('/api/health', wrap(async (_req, res) => {
   const { error } = await supabase.from('settings').select('key').limit(1)
-  if (error) return fail(res, 503, 'Não foi possível conectar ao Supabase. Confira a configuração do servidor.')
+  if (error) {
+    log('error', 'health.database.failed', {
+      requestId: _req.requestId,
+      ...errorDetails(error)
+    })
+    return fail(res, 503, 'Não foi possível conectar ao Supabase. Confira a configuração do servidor.')
+  }
   res.json({ ok: true, database: 'supabase' })
 }))
 app.get('/api/me', (req, res, next) => {
@@ -233,6 +240,15 @@ app.post('/api/organizer/login', wrap(async (req, res) => {
     email, password: String(req.body.password || '')
   })
   if (error || !data.user) {
+    const invalidCredentials = error?.code === 'invalid_credentials' ||
+      error?.code === 'email_not_confirmed' || error?.status === 400
+    if (error && !invalidCredentials) {
+      log('error', 'organizer.login.auth_failed', {
+        requestId: req.requestId,
+        ...errorDetails(error)
+      })
+      return fail(res, 500, 'Não foi possível concluir. Tente novamente.')
+    }
     if (await recordBadLogin(keys)) return fail(res, 429, 'Muitas tentativas. Tente novamente em 10 minutos.')
     logRequest(req, 'organizer.login.rejected')
     return fail(res, 401, 'E-mail ou senha incorretos.')
@@ -888,4 +904,8 @@ app.use((error, req, res, _next) => {
   const message = status === 500 ? 'Não foi possível concluir. Tente novamente.' : error.message
   res.status(status).json({ error: message })
 })
-app.listen(port, () => log('info', 'server.started', { port, environment: production ? 'production' : 'development' }))
+if (process.env.VERCEL !== '1') {
+  app.listen(port, () => log('info', 'server.started', { port, environment: production ? 'production' : 'development' }))
+}
+
+export default app
