@@ -16,8 +16,19 @@ const SESSION_DAYS = 365
 function requestPath(req) {
   const route = req.route?.path
   if (route) return `${req.baseUrl}${Array.isArray(route) ? route[0] : route}`
-  return req.path.replace(/(\/api\/invitations\/)[^/]+/i, '$1:token')
+  return req.originalUrl.split('?')[0].replace(/(\/api\/invitations\/)[^/]+/i, '$1:token')
     .replace(/\/[0-9a-f]{8}-[0-9a-f-]{27,}/gi, '/:id')
+}
+
+function errorCodeFor(status) {
+  if (status === 401) return 'UNAUTHENTICATED'
+  if (status === 403) return 'FORBIDDEN'
+  if (status === 404) return 'RESOURCE_NOT_FOUND'
+  if (status === 405) return 'METHOD_NOT_ALLOWED'
+  if (status === 409) return 'CONFLICT'
+  if (status === 422) return 'VALIDATION_ERROR'
+  if (status === 429) return 'TOO_MANY_REQUESTS'
+  return 'INTERNAL_ERROR'
 }
 
 app.disable('x-powered-by')
@@ -29,18 +40,29 @@ app.use((req, res, next) => {
   res.setHeader('X-Request-Id', requestId)
   res.on('finish', () => {
     const status = res.statusCode
-    const routeParams = req.params?.id && /^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(req.params.id)
-      ? { id: req.params.id }
-      : undefined
     log(status >= 400 ? 'error' : 'info', 'http.request', {
       requestId,
       method: req.method,
       path: requestPath(req),
-      ...(routeParams ? { routeParams } : {}),
+      ...(req.logRouteParams ? { routeParams: req.logRouteParams } : {}),
       status,
+      ...(status >= 400 ? {
+        errorCode: res.locals.apiErrorCode || errorCodeFor(status),
+        ...(res.locals.apiErrorMessage
+          ? { errorMessage: errorDetails(new Error(res.locals.apiErrorMessage)).errorMessage }
+          : {})
+      } : {}),
       durationMs: Number(process.hrtime.bigint() - startedAt) / 1e6
     })
   })
+  next()
+})
+app.param('id', (req, _res, next, id) => {
+  req.logRouteParams = { ...req.logRouteParams, id }
+  next()
+})
+app.param('token', (req, _res, next) => {
+  req.logRouteParams = { ...req.logRouteParams, token: '[redacted]' }
   next()
 })
 app.use(express.json({ limit: '32kb' }))
@@ -57,7 +79,7 @@ app.use((req, res, next) => {
     try {
       requestOrigin = new URL(origin)
     } catch {
-      return res.status(403).json({ error: 'Origem não permitida.' })
+      return fail(res, 403, 'Origem não permitida.')
     }
 
     const isLocalDevelopmentOrigin = !production &&
@@ -65,7 +87,7 @@ app.use((req, res, next) => {
       ['localhost', '127.0.0.1', '[::1]'].includes(requestOrigin.hostname)
     const expectedOrigin = production ? `${req.protocol}://${req.get('host')}` : configuredOrigin
     if (requestOrigin.origin !== expectedOrigin && !isLocalDevelopmentOrigin) {
-      return res.status(403).json({ error: 'Origem não permitida.' })
+      return fail(res, 403, 'Origem não permitida.')
     }
   }
   next()
@@ -75,7 +97,16 @@ const now = () => new Date().toISOString()
 const logRequest = (req, event, fields = {}, level = 'info') => log(level, event, { requestId: req.requestId, ...fields })
 const hash = (value) => createHash('sha256').update(value).digest('hex')
 const token = () => randomBytes(32).toString('base64url')
-const fail = (res, status, message) => res.status(status).json({ error: message })
+const fail = (res, status, message, code, details) => {
+  const normalizedStatus = status === 400 ? 422 : status
+  const errorCode = code || errorCodeFor(normalizedStatus)
+  res.locals.apiErrorCode = errorCode
+  res.locals.apiErrorMessage = message
+  return res.status(normalizedStatus).json({
+    error: { code: errorCode, message, ...(details ? { details } : {}) },
+    requestId: res.getHeader('X-Request-Id')
+  })
+}
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next)
 const normalizeTime = (value) => {
   const time = String(value || '')
@@ -205,7 +236,8 @@ app.get('/api/health', wrap(async (req, res) => {
         ...errorDetails(error)
       })
     }
-    return res.status(503).json({ ok: false, database: 'supabase', checks })
+    return fail(res, 503, 'Não foi possível conectar ao Supabase. Confira a configuração do servidor.',
+      'SERVICE_UNAVAILABLE', { database: 'supabase', checks })
   }
   res.json({ ok: true, database: 'supabase', checks })
 }))
@@ -908,7 +940,21 @@ app.patch('/api/owner/settings', auth, requireOwner, wrap(async (req, res) => {
 }))
 
 app.use('/api', (req, res) => {
-  fail(res, 404, 'Rota da API não encontrada.')
+  const path = req.originalUrl.split('?')[0]
+  const matchedLayer = app._router.stack.find(layer =>
+    layer.route && layer.route.path !== '*' && layer.match(path)
+  )
+  if (matchedLayer) {
+    req.logRouteParams = Object.fromEntries(Object.entries(matchedLayer.params || {})
+      .map(([name, value]) => [name, name === 'token' ? '[redacted]' : value]))
+    const allowedMethods = Object.keys(matchedLayer.route.methods)
+      .filter(method => matchedLayer.route.methods[method])
+      .map(method => method.toUpperCase())
+    if (allowedMethods.includes('GET') && !allowedMethods.includes('HEAD')) allowedMethods.push('HEAD')
+    res.setHeader('Allow', allowedMethods.join(', '))
+    return fail(res, 405, 'Este método não é permitido para esta rota.')
+  }
+  fail(res, 404, 'Rota da API não encontrada.', 'ROUTE_NOT_FOUND')
 })
 
 let recurrenceBusy = false
@@ -945,18 +991,28 @@ app.use((error, req, res, _next) => {
   const mappedStatus = error.code === '42501' ? 403
     : error.code === 'P0002' ? 404
       : error.code === '23505' || error.code === '23514' || error.code === 'P0001' ? 409
-        : error.code === '22023' ? 400 : null
-  const status = mappedStatus || (Number.isInteger(error.status) && error.status >= 400 && error.status < 500 ? error.status : 500)
+        : error.code === '22023' ? 422 : null
+  const rawStatus = mappedStatus || (Number.isInteger(error.status) && error.status >= 400 && error.status < 500 ? error.status : 500)
+  const status = rawStatus === 400 ? 422 : rawStatus
+  const errorCode = status === 409 && error.code === '23505' && /lista deste evento/i.test(error.message)
+    ? 'ALREADY_REGISTERED'
+    : errorCodeFor(status)
+  const safeMessage = status === 500 ? 'Não foi possível concluir. Tente novamente.' : error.message
+  res.locals.apiErrorCode = errorCode
+  res.locals.apiErrorMessage = error.message
   log(status >= 500 ? 'error' : 'warn', 'api.error', {
     requestId: req.requestId,
     method: req.method,
     path: requestPath(req),
     status,
+    errorCode,
     ...errorDetails(error)
   })
   if (res.headersSent) return
-  const message = status === 500 ? 'Não foi possível concluir. Tente novamente.' : error.message
-  res.status(status).json({ error: message })
+  res.status(status).json({
+    error: { code: errorCode, message: safeMessage },
+    requestId: req.requestId
+  })
 })
 if (process.env.VERCEL !== '1') {
   app.listen(port, () => log('info', 'server.started', { port, environment: production ? 'production' : 'development' }))

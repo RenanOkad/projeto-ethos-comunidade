@@ -17,18 +17,60 @@ type EventItem = {
 type Registration = { id: string; name: string; person_id: string; phone?: string; situation: string; payment: string; wait_position: number | null; notice_seen: number; promoted_at?: string }
 type OccurrenceDetail = { occurrence: EventItem; registrations: Registration[]; closedForJoin: boolean; ownerName: string; ownerWhatsapp: string }
 
+class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code: string,
+    readonly requestId: string | null,
+    readonly retryable: boolean
+  ) {
+    super(message)
+    this.name = 'ApiError'
+  }
+}
+
 async function api<T = Record<string, unknown>>(path: string, init: Omit<RequestInit, 'body'> & { body?: unknown } = {}): Promise<T> {
-  const response = await fetch(`/api${path}`, {
-    ...init, credentials: 'same-origin',
-    headers: { ...(init.body ? { 'Content-Type': 'application/json' } : {}), ...init.headers },
-    body: init.body === undefined ? undefined : typeof init.body === 'string' ? init.body : JSON.stringify(init.body)
-  })
-  const result = await response.json().catch(() => ({}))
+  let response: Response
+  try {
+    response = await fetch(`/api${path}`, {
+      ...init, credentials: 'same-origin',
+      headers: { ...(init.body ? { 'Content-Type': 'application/json' } : {}), ...init.headers },
+      body: init.body === undefined ? undefined : typeof init.body === 'string' ? init.body : JSON.stringify(init.body)
+    })
+  } catch {
+    throw new ApiError('Não foi possível conectar. Tente novamente.', 0, 'NETWORK_ERROR', null, true)
+  }
+  const result = await response.json().catch(() => null) as {
+    error?: string | { code?: string; message?: string }
+    requestId?: string
+  } | null
   if (!response.ok) {
-    const failure = new Error(result.error || 'Não foi possível concluir. Tente novamente.') as Error & { status: number; requestId: string | null }
-    failure.status = response.status
-    failure.requestId = response.headers.get('X-Request-Id')
-    throw failure
+    const requestId = response.headers.get('X-Request-Id') || result?.requestId || null
+    const error = result?.error
+    const code = typeof error === 'object' && error ? error.code || 'API_ERROR' : 'API_ERROR'
+    const serverMessage = typeof error === 'string' ? error
+      : typeof error === 'object' && error ? error.message : ''
+    const messages: Record<number, string> = {
+      401: 'Sua sessão expirou. Entre novamente.',
+      403: 'Você não tem permissão para realizar esta ação.',
+      404: code === 'ROUTE_NOT_FOUND' ? 'Este endereço da API não existe.' : 'O evento ou recurso não foi encontrado.',
+      405: 'Esta ação não está disponível para a rota solicitada.',
+      409: code === 'ALREADY_REGISTERED' ? 'Você já está inscrito neste evento.' : 'Não foi possível concluir por causa de um conflito.',
+      422: 'Confira os dados informados e tente novamente.',
+      429: 'Muitas tentativas. Aguarde antes de tentar novamente.',
+      500: 'O serviço está temporariamente indisponível. Tente novamente.',
+      503: 'O serviço está temporariamente indisponível. Tente novamente.'
+    }
+    const message = serverMessage || messages[response.status] || 'Não foi possível concluir a solicitação.'
+    const codeSuffix = requestId ? ` (código ${requestId.slice(0, 8)})` : ''
+    throw new ApiError(
+      `${message}${codeSuffix}`,
+      response.status,
+      code,
+      requestId,
+      response.status === 0 || response.status >= 500 || response.status === 429
+    )
   }
   return result as T
 }
@@ -168,19 +210,18 @@ function App() {
     setDetailLoading(true)
     try { setDetail(await api<OccurrenceDetail>(`/occurrences/${encodeURIComponent(item.id)}`)) }
     catch (error) {
-      const failure = error as Error & { status?: number; requestId?: string | null }
+      const failure = error instanceof ApiError ? error : null
       const message = error instanceof Error ? error.message : 'Não foi possível abrir o evento.'
-      const notFound = failure.status === 404
       console.error(JSON.stringify({
         event: 'occurrence.detail.failed',
         query: 'GET /api/occurrences/:id',
-        requestId: failure.requestId || null,
-        status: failure.status || null,
-        errorName: failure.name || 'Error',
+        requestId: failure?.requestId || null,
+        status: failure?.status || null,
+        errorName: failure?.name || 'Error',
         errorMessage: message
       }))
-      setDetailError(notFound ? 'Este evento não foi encontrado.' : message)
-      setDetailCanRetry(!failure.status || failure.status >= 500)
+      setDetailError(message)
+      setDetailCanRetry(failure?.retryable ?? true)
     } finally { setDetailLoading(false) }
   }
   async function handle(action: () => Promise<unknown>, success: string, reload = true) {

@@ -9,6 +9,7 @@
     "web": "vite",
     "build": "tsc -b && vite build",
     "test": "node --test",
+    "smoke": "node scripts/smoke.js",
     "start": "node server/index.js",
     "owner:invite": "node scripts/invite-owner.js"
   },
