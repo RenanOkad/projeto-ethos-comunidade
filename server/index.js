@@ -171,16 +171,39 @@ async function loginIsBlocked(keys) {
 const recordBadLogin = (keys) => rpc('record_login_failure', { p_attempt_keys: keys })
 const clearBadLogin = (keys) => rpc('clear_login_failures', { p_attempt_keys: keys })
 
-app.get('/api/health', wrap(async (_req, res) => {
-  const { error } = await supabase.from('settings').select('key').limit(1)
-  if (error) {
-    log('error', 'health.database.failed', {
-      requestId: _req.requestId,
-      ...errorDetails(error)
-    })
-    return fail(res, 503, 'Não foi possível conectar ao Supabase. Confira a configuração do servidor.')
+app.get('/api/health', wrap(async (req, res) => {
+  const schemaQuery = (table, columns) => supabase.from(table).select(columns, { head: true }).limit(0)
+  const schemaChecks = [
+    { name: 'settings', query: schemaQuery('settings', 'key,value') },
+    { name: 'modalities', query: schemaQuery('modalities', 'id,name,slug,archived_at') },
+    { name: 'events', query: schemaQuery('events', 'id,modality_id') },
+    { name: 'occurrences', query: schemaQuery('occurrences', 'id,event_id,starts_at,ends_at') },
+    { name: 'occurrence_event_modality_join', query: supabase.from('occurrences')
+      .select('id,events!inner(id,modality_id,modalities!inner(id,archived_at))', { head: true }).limit(0) },
+    { name: 'registrations', query: schemaQuery('registrations', 'id,occurrence_id,person_id,situation,payment,wait_position,notice_seen,promoted_at,created_at') },
+    { name: 'people', query: schemaQuery('people', 'id,name,phone') },
+    { name: 'sessions', query: schemaQuery('sessions', 'token_hash,kind,person_id,organizer_id,expires_at') },
+    { name: 'organizers', query: schemaQuery('organizers', 'id,user_id,name,email,role,active') },
+    { name: 'invitations', query: schemaQuery('invitations', 'id,email,role,token_hash,expires_at,used_at,cancelled_at') },
+    { name: 'audit', query: schemaQuery('audit', 'id,actor_kind,actor_id,action,target_kind,target_id,details,created_at') }
+  ]
+  const results = await Promise.all(schemaChecks.map(async ({ name, query }) => ({
+    name,
+    ...await query
+  })))
+  const checks = Object.fromEntries(results.map(({ name, error }) => [name, error ? 'error' : 'ok']))
+  const failed = results.filter(({ error }) => error)
+  if (failed.length) {
+    for (const { name, error } of failed) {
+      log('error', 'health.schema_check.failed', {
+        requestId: req.requestId,
+        query: name,
+        ...errorDetails(error)
+      })
+    }
+    return res.status(503).json({ ok: false, database: 'supabase', checks })
   }
-  res.json({ ok: true, database: 'supabase' })
+  res.json({ ok: true, database: 'supabase', checks })
 }))
 app.get('/api/me', (req, res, next) => {
   if (!cookies(req.headers.cookie).ethos_session) return res.json({ user: null })
@@ -395,6 +418,19 @@ async function registrationsByOccurrence(occurrenceIds) {
     .in('occurrence_id', occurrenceIds))
 }
 
+async function occurrenceDetailQuery(req, queryName, query) {
+  try {
+    return await query
+  } catch (error) {
+    log('error', 'occurrence.detail.query_failed', {
+      requestId: req.requestId,
+      query: queryName,
+      ...errorDetails(error)
+    })
+    throw error
+  }
+}
+
 app.get('/api/events', auth, wrap(async (req, res) => {
  let query = supabase.from('occurrences')
    .select('*,events!inner(name,modality_id,type,active,modalities!inner(id,name,slug,archived_at))')
@@ -563,16 +599,19 @@ app.get('/api/my-registrations', auth, requirePerson, wrap(async (req, res) => {
 }))
 
 app.get('/api/occurrences/:id', auth, wrap(async (req, res) => {
-  const occurrence = await result(supabase.from('occurrences').select('*,events!inner(name,modality_id,type,modalities!inner(id,name,slug,archived_at))')
-    .eq('id', req.params.id).maybeSingle())
+  const occurrence = await occurrenceDetailQuery(req, 'occurrence_with_event_and_modality',
+    result(supabase.from('occurrences').select('*,events!inner(name,modality_id,type,modalities!inner(id,name,slug,archived_at))')
+      .eq('id', req.params.id).maybeSingle()))
   if (!occurrence) return fail(res, 404, 'Este evento não foi encontrado.')
   const { events: event, ...row } = occurrence
-  const registrations = await result(supabase.from('registrations').select('*')
-    .eq('occurrence_id', occurrence.id).order('wait_position', { ascending: true, nullsFirst: true })
-    .order('created_at'))
+  const registrations = await occurrenceDetailQuery(req, 'registrations_for_occurrence',
+    result(supabase.from('registrations').select('*')
+      .eq('occurrence_id', occurrence.id).order('wait_position', { ascending: true, nullsFirst: true })
+      .order('created_at')))
   const personIds = [...new Set(registrations.map((registration) => registration.person_id))]
   const people = personIds.length
-    ? await result(supabase.from('people').select('id,name,phone').in('id', personIds))
+    ? await occurrenceDetailQuery(req, 'people_for_registrations',
+      result(supabase.from('people').select('id,name,phone').in('id', personIds)))
     : []
   const organizer = req.user.kind === 'organizer'
   const peopleById = new Map(people.map((person) => [person.id, person]))
@@ -588,7 +627,10 @@ app.get('/api/occurrences/:id', auth, wrap(async (req, res) => {
   }).sort((left, right) => left.situation === right.situation
     ? (left.situation === 'confirmed' ? left.created_at.localeCompare(right.created_at) : left.wait_position - right.wait_position)
     : left.situation === 'confirmed' ? -1 : 1)
-  const [ownerName, ownerWhatsapp] = await Promise.all([setting('owner_name'), setting('owner_whatsapp')])
+  const [ownerName, ownerWhatsapp] = await Promise.all([
+    occurrenceDetailQuery(req, 'owner_name_setting', setting('owner_name')),
+    occurrenceDetailQuery(req, 'owner_whatsapp_setting', setting('owner_whatsapp'))
+  ])
   res.json({
     occurrence: {
       ...row, name: event.name, modality_id: event.modality_id,

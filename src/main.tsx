@@ -24,7 +24,12 @@ async function api<T = Record<string, unknown>>(path: string, init: Omit<Request
     body: init.body === undefined ? undefined : typeof init.body === 'string' ? init.body : JSON.stringify(init.body)
   })
   const result = await response.json().catch(() => ({}))
-  if (!response.ok) throw new Error(result.error || 'Não foi possível concluir. Tente novamente.')
+  if (!response.ok) {
+    const failure = new Error(result.error || 'Não foi possível concluir. Tente novamente.') as Error & { status: number; requestId: string | null }
+    failure.status = response.status
+    failure.requestId = response.headers.get('X-Request-Id')
+    throw failure
+  }
   return result as T
 }
 const money = (cents: number) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(cents / 100)
@@ -68,6 +73,8 @@ function App() {
   const [modalities, setModalities] = useState<Modality[]>([])
   const [mine, setMine] = useState<EventItem[]>([])
   const [detail, setDetail] = useState<OccurrenceDetail | null>(null)
+  const [detailLoading, setDetailLoading] = useState(false)
+  const [detailError, setDetailError] = useState('')
   const [busy, setBusy] = useState(true)
   const [error, setError] = useState('')
   const [toast, setToast] = useState('')
@@ -151,12 +158,26 @@ function App() {
     if (user?.role === 'owner' && screen === 'organizers') void api<{organizers:typeof organizers;invitations:typeof invitations;whatsapp:string;defaultPix:string}>('/owner/organizers').then(r => { setOrganizers(r.organizers); setInvitations(r.invitations); setOwnerSettings({whatsapp:r.whatsapp,defaultPix:r.defaultPix}) }).catch(e => setError(e.message))
   }, [user, screen])
 
-  async function openEvent(item: EventItem) {
+  async function openEvent(item: Pick<EventItem, 'id'>) {
     setSelectedId(item.id)
     setScreen('detail')
     setDetail(null)
-    try { setDetail(await api<OccurrenceDetail>(`/occurrences/${item.id}`)) }
-    catch (e) { setError(e instanceof Error ? e.message : 'Não foi possível abrir o evento.') }
+    setDetailError('')
+    setDetailLoading(true)
+    try { setDetail(await api<OccurrenceDetail>(`/occurrences/${encodeURIComponent(item.id)}`)) }
+    catch (error) {
+      const failure = error as Error & { status?: number; requestId?: string | null }
+      const message = error instanceof Error ? error.message : 'Não foi possível abrir o evento.'
+      console.error(JSON.stringify({
+        event: 'occurrence.detail.failed',
+        query: 'GET /api/occurrences/:id',
+        requestId: failure.requestId || null,
+        status: failure.status || null,
+        errorName: failure.name || 'Error',
+        errorMessage: message
+      }))
+      setDetailError(message)
+    } finally { setDetailLoading(false) }
   }
   async function handle(action: () => Promise<unknown>, success: string, reload = true) {
     setError('')
@@ -165,7 +186,7 @@ function App() {
       notify(success)
       if (reload) {
         await refresh()
-        if (screen === 'detail') await openEvent({ id: selectedId } as EventItem)
+        if (screen === 'detail') await openEvent({ id: selectedId })
         if (user?.kind === 'organizer' && screen === 'people') setPeople((await api<{people:typeof people}>('/admin/people')).people)
         if (user?.role === 'owner' && screen === 'organizers') {
           const result = await api<{organizers:typeof organizers;invitations:typeof invitations;whatsapp:string;defaultPix:string}>('/owner/organizers')
@@ -217,7 +238,7 @@ function App() {
 
     {screen === 'detail' && <main className="page">
       <button className="back-button" onClick={() => setScreen(organizer ? 'admin' : 'events')}><Icon name="back" /> Voltar</button>
-      {!detail ? <div className="skeleton-card" /> : <EventDetail detail={detail} user={user} onJoin={() => void handle(() => api(`/occurrences/${detail.occurrence.id}/join`, { method: 'POST' }), 'Sua inscrição foi registrada!')}
+      {detailLoading ? <div className="skeleton-card" /> : detailError ? <div className="alert alert-error detail-load-error" role="alert"><span>{detailError}</span><button className="button secondary small" onClick={() => void openEvent({id:selectedId})}>Tentar novamente</button></div> : !detail ? null : <EventDetail detail={detail} user={user} onJoin={() => void handle(() => api(`/occurrences/${detail.occurrence.id}/join`, { method: 'POST' }), 'Sua inscrição foi registrada!')}
         onLeave={() => { const r = detail.registrations.find(x => x.person_id === user.id); if (r?.payment === 'paid') setModal('paid-leave'); else setModal('leave') }}
         onPayment={(r, paid) => void handle(() => api(`/admin/registrations/${r.id}/payment`, { method: 'PATCH', body: { paid } }), paid ? 'Pagamento confirmado.' : 'Pagamento atualizado.')}
         onRemove={(r) => { setSelectedId(r.id); setModal('remove-registration') }} onClose={() => setScreen(organizer ? 'admin' : 'events')} /> }

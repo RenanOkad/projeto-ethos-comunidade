@@ -146,6 +146,7 @@ input[readonly] { color: var(--tinta-2); background: #f7f6f1; }
 .sticky-action { position: sticky; bottom: 82px; z-index: 2; padding: 12px 0 8px; background: linear-gradient(transparent,var(--fundo) 18%); }
 .sticky-action small { display: block; padding: 7px; color: var(--tinta-2); text-align: center; font-size: 11px; }
 .skeleton-card { height: 240px; border-radius: 18px; background: linear-gradient(90deg,#e7e5dc,#f7f5ef,#e7e5dc); background-size: 200% 100%; animation: shimmer 1.3s infinite; }
+.detail-load-error { margin: 0; align-items: flex-start; flex-wrap: wrap; }
 @keyframes shimmer { to { background-position: -200% 0; } }
 .admin-heading { display: flex; justify-content: space-between; align-items: center; gap: 15px; margin: 8px 0 18px; }
 .admin-heading h1 { margin: 0; }
