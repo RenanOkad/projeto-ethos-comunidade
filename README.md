@@ -34,8 +34,17 @@ No **SQL Editor** do Supabase, execute nesta ordem:
 2. [`supabase/004_backend_integration.sql`](./supabase/004_backend_integration.sql) — sessões de participantes/organizadores e RPCs consumidas pela API.
 3. [`supabase/005_event_modalities.sql`](./supabase/005_event_modalities.sql) — migração de eventos legados para o catálogo de modalidades (pode ser executada em instalação nova).
 4. [`supabase/006_modality_lifecycle.sql`](./supabase/006_modality_lifecycle.sql) — arquivamento, mesclagem e exclusão segura de modalidades.
+5. [`supabase/007_fix_leave_occurrence_promotion.sql`](./supabase/007_fix_leave_occurrence_promotion.sql) — corrige a promoção da lista de espera ao sair de uma vaga confirmada.
 
 Em bancos já existentes, execute `005` antes de `006`. A migração `006` é aditiva e repetível; para revertê-la, primeiro reverta o código da aplicação, reative os registros arquivados e siga os comandos de rollback anotados no próprio arquivo.
+
+Antes de aplicar a migração `007` em produção, faça ou confirme um backup recente do banco pelo painel do Supabase. Depois, abra **SQL Editor**, execute o conteúdo inteiro de `007_fix_leave_occurrence_promotion.sql` e confirme que terminou sem erro. Ela apenas substitui a função `leave_occurrence(uuid, uuid)` e reafirma suas permissões; não altera nem apaga registros. A operação é idempotente. Para conferir a definição instalada, execute:
+
+```sql
+select pg_get_functiondef('public.leave_occurrence(uuid, uuid)'::regprocedure);
+```
+
+O resultado deve chamar `public.promote_next_waitlisted(...)` ao remover uma inscrição confirmada. Não é necessário reaplicar `001` nem executar alterações manuais em inscrições.
 
 Em **Authentication → Providers**, habilite o provedor **Email**. Depois, configure o `.env`, instale as dependências e inicie a aplicação:
 
@@ -99,9 +108,11 @@ O comando percorre os métodos e caminhos usados pelo front-end, incluindo rotas
 
 Se o Preview exigir proteção da Vercel, configure localmente `VERCEL_AUTOMATION_BYPASS_SECRET` com o segredo de **Protection Bypass for Automation** do projeto antes de executar o comando. O smoke envia esse valor no header recomendado pela Vercel e não o imprime nem o salva no repositório.
 
+Para executar também os logins reais, defina localmente as variáveis `SMOKE_PERSON_PHONE`, `SMOKE_PERSON_PIN`, `SMOKE_ORGANIZER_EMAIL`, `SMOKE_ORGANIZER_PASSWORD` e `SMOKE_OCCURRENCE_ID` com uma conta de teste dedicada e uma ocorrência apropriada. Não grave esses valores em arquivos versionados. As verificações de `join`, `leave` em vaga confirmada, remoção pelo organizador e recarregamento do detalhe são operações mutáveis: só são executadas se também definir `SMOKE_RUN_MUTATIONS=1`. Use uma ocorrência de teste aberta, antes do horário de fechamento, com vaga confirmada livre e na qual a pessoa de teste ainda não esteja inscrita. O script tenta remover a inscrição de teste ao terminar ou após falha; não use contas ou ocorrências reais de usuários.
+
 Promova para produção somente depois de o smoke passar no Preview. Opcionalmente, adicione esse comando a um workflow de GitHub Actions que rode após a criação do deploy de Preview, usando a URL do deployment como entrada e bloqueando a promoção se houver falha; essa automação não está ativada por este projeto.
 
-Antes do primeiro uso, aplique no projeto Supabase as migrações `001`, `004`, `005` e `006`, nesta ordem, e crie o convite do owner com `npm run owner:invite` usando `OWNER_EMAIL` local. Use HTTPS para habilitar o atributo `Secure` dos cookies.
+Antes do primeiro uso, aplique no projeto Supabase as migrações `001`, `004`, `005`, `006` e `007`, nesta ordem, e crie o convite do owner com `npm run owner:invite` usando `OWNER_EMAIL` local. Use HTTPS para habilitar o atributo `Secure` dos cookies.
 
 ## Notas de migração
 

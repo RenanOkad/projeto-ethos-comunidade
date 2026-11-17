@@ -1000,7 +1000,7 @@ app.use((error, req, res, _next) => {
   const safeMessage = status === 500 ? 'Não foi possível concluir. Tente novamente.' : error.message
   res.locals.apiErrorCode = errorCode
   res.locals.apiErrorMessage = error.message
-  log(status >= 500 ? 'error' : 'warn', 'api.error', {
+  log('error', 'api.error', {
     requestId: req.requestId,
     method: req.method,
     path: requestPath(req),

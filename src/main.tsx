@@ -48,9 +48,11 @@ async function api<T = Record<string, unknown>>(path: string, init: Omit<Request
   if (!response.ok) {
     const requestId = response.headers.get('X-Request-Id') || result?.requestId || null
     const error = result?.error
-    const code = typeof error === 'object' && error ? error.code || 'API_ERROR' : 'API_ERROR'
+    const code = typeof error === 'object' && error && typeof error.code === 'string'
+      ? error.code
+      : 'API_ERROR'
     const serverMessage = typeof error === 'string' ? error
-      : typeof error === 'object' && error ? error.message : ''
+      : typeof error === 'object' && error && typeof error.message === 'string' ? error.message : ''
     const messages: Record<number, string> = {
       401: 'Sua sessão expirou. Entre novamente.',
       403: 'Você não tem permissão para realizar esta ação.',
@@ -132,6 +134,7 @@ function App() {
   const [inviteLink, setInviteLink] = useState('')
   const [modal, setModal] = useState('')
   const [selectedId, setSelectedId] = useState('')
+  const [detailOccurrenceId, setDetailOccurrenceId] = useState('')
   const [editingEvent, setEditingEvent] = useState<EventItem | null>(null)
   const [modalityReturnScreen, setModalityReturnScreen] = useState('')
   const [preferredModalityId, setPreferredModalityId] = useState('')
@@ -202,7 +205,7 @@ function App() {
   }, [user, screen])
 
   async function openEvent(item: Pick<EventItem, 'id'>) {
-    setSelectedId(item.id)
+    setDetailOccurrenceId(item.id)
     setScreen('detail')
     setDetail(null)
     setDetailError('')
@@ -231,7 +234,7 @@ function App() {
       notify(success)
       if (reload) {
         await refresh()
-        if (screen === 'detail') await openEvent({ id: selectedId })
+        if (screen === 'detail') await openEvent({ id: detailOccurrenceId })
         if (user?.kind === 'organizer' && screen === 'people') setPeople((await api<{people:typeof people}>('/admin/people')).people)
         if (user?.role === 'owner' && screen === 'organizers') {
           const result = await api<{organizers:typeof organizers;invitations:typeof invitations;whatsapp:string;defaultPix:string}>('/owner/organizers')
@@ -241,6 +244,18 @@ function App() {
       return true
     }
     catch (e) { setError(e instanceof Error ? e.message : 'Não foi possível concluir. Tente novamente.'); return false }
+  }
+  async function closeEventSeries() {
+    if (!detail) return
+    const closed = await handle(
+      () => api(`/admin/events/${detail.occurrence.event_id}/close`, { method: 'PATCH' }),
+      'Série encerrada.',
+      false
+    )
+    if (closed) {
+      await refresh()
+      setScreen('admin')
+    }
   }
   async function logout() { await api('/logout', { method: 'POST' }); setUser(null); setScreen('events'); setEvents([]); setMine([]) }
 
@@ -283,10 +298,10 @@ function App() {
 
     {screen === 'detail' && <main className="page">
       <button className="back-button" onClick={() => setScreen(organizer ? 'admin' : 'events')}><Icon name="back" /> Voltar</button>
-      {detailLoading ? <div className="skeleton-card" /> : detailError ? <div className="alert alert-error detail-load-error" role="alert"><span>{detailError}</span>{detailCanRetry&&<button className="button secondary small" onClick={() => void openEvent({id:selectedId})}>Tentar novamente</button>}</div> : !detail ? null : <EventDetail detail={detail} user={user} onJoin={() => void handle(() => api(`/occurrences/${detail.occurrence.id}/join`, { method: 'POST' }), 'Sua inscrição foi registrada!')}
+      {detailLoading ? <div className="skeleton-card" /> : detailError ? <div className="alert alert-error detail-load-error" role="alert"><span>{detailError}</span>{detailCanRetry && <button className="button secondary small" onClick={() => void openEvent({id:detailOccurrenceId})}>Tentar novamente</button>}</div> : !detail ? null : <EventDetail detail={detail} user={user} onJoin={() => void handle(() => api(`/occurrences/${detail.occurrence.id}/join`, { method: 'POST' }), 'Sua inscrição foi registrada!')}
         onLeave={() => { const r = detail.registrations.find(x => x.person_id === user.id); if (r?.payment === 'paid') setModal('paid-leave'); else setModal('leave') }}
         onPayment={(r, paid) => void handle(() => api(`/admin/registrations/${r.id}/payment`, { method: 'PATCH', body: { paid } }), paid ? 'Pagamento confirmado.' : 'Pagamento atualizado.')}
-        onRemove={(r) => { setSelectedId(r.id); setModal('remove-registration') }} onClose={() => setScreen(organizer ? 'admin' : 'events')} /> }
+        onRemove={(r) => { setSelectedId(r.id); setModal('remove-registration') }} onClose={() => void closeEventSeries()} /> }
     </main>}
 
     {organizer && screen === 'admin' && <main className="page wide">
@@ -420,7 +435,7 @@ function EventDetail({detail,user,onJoin,onLeave,onPayment,onRemove,onClose}:{de
     <div className="info-note"><strong>Inscrições e desistências até {event.cutoff_hours}h antes do início ({formatDate(cutoffTime,{weekday:'short',hour:'2-digit',minute:'2-digit'})}).</strong><br/>Fez o Pix? O organizador confirma seu pagamento e o status muda para Pago.</div>
     {participant && <div className="sticky-action">{own ? own.payment==='paid'&&own.situation==='confirmed' ? <button className="button secondary full" onClick={onLeave}>Falar com o organizador para desistir</button> : <button className="button secondary full" disabled={!canChange} onClick={onLeave}>{canChange?'Desistir da vaga':'Prazo encerrado'}</button> : <button className="button primary full" disabled={!canChange} onClick={onJoin}>{!canChange?'Inscrições encerradas':lot?'Entrar na lista de espera':'Entrar na lista'}</button>}{!canChange&&<><small>As inscrições e desistências fecharam. Fale com um organizador se precisar de ajuda.</small>{detail.ownerWhatsapp&&<a className="text-button underlined" href={`https://wa.me/${detail.ownerWhatsapp}`} target="_blank" rel="noreferrer">Falar com um organizador no WhatsApp</a>}</>}</div>}
     {!participant&&<div className="info-note">Só o organizador altera o status de pagamento. O telefone aparece apenas aqui.</div>}
-    {user.role==='owner'&&<button className="button danger full" onClick={()=>{if(confirm('Encerrar esta série? As próximas ocorrências não serão abertas.'))void api(`/admin/events/${event.event_id}/close`,{method:'PATCH'}).then(onClose)}}>Encerrar série</button>}
+    {user.role==='owner'&&<button className="button danger full" onClick={()=>{if(confirm('Encerrar esta série? As próximas ocorrências não serão abertas.'))void onClose()}}>Encerrar série</button>}
   </div>
 }
 
