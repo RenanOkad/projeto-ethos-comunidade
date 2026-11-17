@@ -918,11 +918,15 @@ async function runRecurrenceJob() {
     log('error', 'recurrence.failed', errorDetails(error))
   } finally { recurrenceBusy = false }
 }
-const recurrenceTimer = setInterval(() => {
+if (process.env.VERCEL !== '1') {
+  const recurrenceTimer = setInterval(() => {
+    void runRecurrenceJob()
+  }, 60 * 60 * 1000)
+  recurrenceTimer.unref()
   void runRecurrenceJob()
-}, 60 * 60 * 1000)
-recurrenceTimer.unref()
-void runRecurrenceJob()
+} else {
+  log('info', 'recurrence.disabled', { reason: 'serverless_runtime' })
+}
 
 const dist = resolve('dist')
 if (existsSync(dist)) {
