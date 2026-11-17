@@ -75,6 +75,7 @@ function App() {
   const [detail, setDetail] = useState<OccurrenceDetail | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
   const [detailError, setDetailError] = useState('')
+  const [detailCanRetry, setDetailCanRetry] = useState(false)
   const [busy, setBusy] = useState(true)
   const [error, setError] = useState('')
   const [toast, setToast] = useState('')
@@ -163,11 +164,13 @@ function App() {
     setScreen('detail')
     setDetail(null)
     setDetailError('')
+    setDetailCanRetry(false)
     setDetailLoading(true)
     try { setDetail(await api<OccurrenceDetail>(`/occurrences/${encodeURIComponent(item.id)}`)) }
     catch (error) {
       const failure = error as Error & { status?: number; requestId?: string | null }
       const message = error instanceof Error ? error.message : 'Não foi possível abrir o evento.'
+      const notFound = failure.status === 404
       console.error(JSON.stringify({
         event: 'occurrence.detail.failed',
         query: 'GET /api/occurrences/:id',
@@ -176,7 +179,8 @@ function App() {
         errorName: failure.name || 'Error',
         errorMessage: message
       }))
-      setDetailError(message)
+      setDetailError(notFound ? 'Este evento não foi encontrado.' : message)
+      setDetailCanRetry(!failure.status || failure.status >= 500)
     } finally { setDetailLoading(false) }
   }
   async function handle(action: () => Promise<unknown>, success: string, reload = true) {
@@ -238,7 +242,7 @@ function App() {
 
     {screen === 'detail' && <main className="page">
       <button className="back-button" onClick={() => setScreen(organizer ? 'admin' : 'events')}><Icon name="back" /> Voltar</button>
-      {detailLoading ? <div className="skeleton-card" /> : detailError ? <div className="alert alert-error detail-load-error" role="alert"><span>{detailError}</span><button className="button secondary small" onClick={() => void openEvent({id:selectedId})}>Tentar novamente</button></div> : !detail ? null : <EventDetail detail={detail} user={user} onJoin={() => void handle(() => api(`/occurrences/${detail.occurrence.id}/join`, { method: 'POST' }), 'Sua inscrição foi registrada!')}
+      {detailLoading ? <div className="skeleton-card" /> : detailError ? <div className="alert alert-error detail-load-error" role="alert"><span>{detailError}</span>{detailCanRetry&&<button className="button secondary small" onClick={() => void openEvent({id:selectedId})}>Tentar novamente</button>}</div> : !detail ? null : <EventDetail detail={detail} user={user} onJoin={() => void handle(() => api(`/occurrences/${detail.occurrence.id}/join`, { method: 'POST' }), 'Sua inscrição foi registrada!')}
         onLeave={() => { const r = detail.registrations.find(x => x.person_id === user.id); if (r?.payment === 'paid') setModal('paid-leave'); else setModal('leave') }}
         onPayment={(r, paid) => void handle(() => api(`/admin/registrations/${r.id}/payment`, { method: 'PATCH', body: { paid } }), paid ? 'Pagamento confirmado.' : 'Pagamento atualizado.')}
         onRemove={(r) => { setSelectedId(r.id); setModal('remove-registration') }} onClose={() => setScreen(organizer ? 'admin' : 'events')} /> }

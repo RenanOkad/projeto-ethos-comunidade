@@ -29,10 +29,14 @@ app.use((req, res, next) => {
   res.setHeader('X-Request-Id', requestId)
   res.on('finish', () => {
     const status = res.statusCode
-    log(status >= 500 ? 'error' : status >= 400 ? 'warn' : 'info', 'http.request', {
+    const routeParams = req.params?.id && /^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(req.params.id)
+      ? { id: req.params.id }
+      : undefined
+    log(status >= 400 ? 'error' : 'info', 'http.request', {
       requestId,
       method: req.method,
       path: requestPath(req),
+      ...(routeParams ? { routeParams } : {}),
       status,
       durationMs: Number(process.hrtime.bigint() - startedAt) / 1e6
     })
@@ -902,6 +906,10 @@ app.patch('/api/owner/settings', auth, requireOwner, wrap(async (req, res) => {
   })
   res.json({ ok: true })
 }))
+
+app.use('/api', (req, res) => {
+  fail(res, 404, 'Rota da API não encontrada.')
+})
 
 let recurrenceBusy = false
 async function runRecurrenceJob() {
