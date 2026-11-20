@@ -13,6 +13,7 @@ type EventItem = {
   my_wait_position?: number; my_payment?: string; closedForJoin?: boolean
   occurrence_id?: string; notice_seen?: number
   weekday?: number; start_time?: string; end_time?: string
+  open?: boolean
 }
 type Registration = { id: string; name: string; person_id: string; phone?: string; situation: string; payment: string; wait_position: number | null; notice_seen: number; promoted_at?: string }
 type OccurrenceDetail = { occurrence: EventItem; registrations: Registration[]; closedForJoin: boolean; ownerName: string; ownerWhatsapp: string }
@@ -89,6 +90,16 @@ const fullDuration = (start: string, end: string) => {
 }
 const timeRange = (event: EventItem) => `${formatTime(event.starts_at)}–${formatTime(event.ends_at)} · ${fullDuration(event.starts_at, event.ends_at)}`
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`
+function reportableOccurrenceCounts(events:EventItem[]) {
+  const today = localDateInput(new Date().toISOString())
+  const now = Date.now()
+  return events.reduce<Record<string, number>>((counts, event) => {
+    if (event.open && localDateInput(event.starts_at) >= today && new Date(event.ends_at).getTime() > now) {
+      counts[event.modality_id] = (counts[event.modality_id] || 0) + 1
+    }
+    return counts
+  }, {})
+}
 
 function Icon({ name }: { name: 'fire' | 'calendar' | 'list' | 'person' | 'arrow' | 'check' | 'empty' | 'close' | 'copy' | 'search' | 'back' | 'plus' | 'clock' | 'pin' }) {
   const paths: Record<string, React.ReactNode> = {
@@ -138,6 +149,7 @@ function App() {
   const [editingEvent, setEditingEvent] = useState<EventItem | null>(null)
   const [modalityReturnScreen, setModalityReturnScreen] = useState('')
   const [preferredModalityId, setPreferredModalityId] = useState('')
+  const [exportingModalityId, setExportingModalityId] = useState('')
 
   const notify = (message: string) => { setToast(message); window.setTimeout(() => setToast(''), 3500) }
   const createModality = async (name:string) => {
@@ -245,6 +257,78 @@ function App() {
     }
     catch (e) { setError(e instanceof Error ? e.message : 'Não foi possível concluir. Tente novamente.'); return false }
   }
+  async function exportModalityReport(modalityId:string) {
+    setExportingModalityId(modalityId)
+    setError('')
+    try {
+      let response:Response
+      try {
+        response = await fetch(`/api/admin/modalities/${encodeURIComponent(modalityId)}/report.xlsx`, {
+          credentials: 'same-origin'
+        })
+      } catch {
+        throw new ApiError('Não foi possível conectar. Tente novamente.', 0, 'NETWORK_ERROR', null, true)
+      }
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null) as {
+          error?: string | { code?: string; message?: string }
+          requestId?: string
+        } | null
+        const requestId = response.headers.get('X-Request-Id') || payload?.requestId || null
+        const errorValue = payload?.error
+        const code = typeof errorValue === 'object' && errorValue && typeof errorValue.code === 'string'
+          ? errorValue.code : ''
+        const serverMessage = typeof errorValue === 'string' ? errorValue
+          : typeof errorValue === 'object' && errorValue && typeof errorValue.message === 'string'
+            ? errorValue.message : ''
+        const message = code === 'REPORT_NO_OCCURRENCES'
+          ? 'Não há eventos elegíveis para exportar.'
+          : serverMessage || (response.status === 401
+            ? 'Sua sessão expirou. Entre novamente.'
+            : response.status === 403
+              ? 'Você não tem permissão para exportar este relatório.'
+              : response.status === 504
+                ? 'A geração do relatório pode ter atingido o limite de tempo da função serverless.'
+              : 'Não foi possível gerar o relatório. Tente novamente.')
+        throw new ApiError(
+          `${message}${requestId ? ` (código ${requestId.slice(0, 8)})` : ''}`,
+          response.status,
+          code || 'REPORT_ERROR',
+          requestId,
+          response.status >= 500
+        )
+      }
+
+      const requestId = response.headers.get('X-Request-Id')
+      if (!response.headers.get('Content-Type')?.toLowerCase().startsWith('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')) {
+        throw new ApiError(
+          `O serviço não retornou um arquivo Excel válido.${requestId ? ` (código ${requestId.slice(0, 8)})` : ''}`,
+          response.status,
+          'INVALID_REPORT_RESPONSE',
+          requestId,
+          false
+        )
+      }
+      const blob = await response.blob()
+      const filename = /filename="([^"]+)"/i.exec(response.headers.get('Content-Disposition') || '')?.[1]
+        || 'ethos-relatorio.xlsx'
+      const url = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download = filename
+      document.body.append(anchor)
+      anchor.click()
+      anchor.remove()
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+      notify(response.headers.get('X-Report-Warning') === 'large'
+        ? 'Relatório baixado. A geração deste arquivo grande pode atingir o limite de tempo da Vercel.'
+        : 'Relatório baixado.')
+    } catch (failure) {
+      setError(failure instanceof ApiError ? failure.message : 'Não foi possível gerar o relatório. Tente novamente.')
+    } finally {
+      setExportingModalityId('')
+    }
+  }
   async function closeEventSeries() {
     if (!detail) return
     const closed = await handle(
@@ -261,6 +345,7 @@ function App() {
 
   const visibleEvents = events.filter(e => (filter === 'all' || e.modality_id === filter) && new Date(e.starts_at).getTime() > Date.now() - 86400000)
   const visibleAdminEvents = events.filter(event => filter === 'all' || event.modality_id === filter)
+  const reportableCounts = reportableOccurrenceCounts(events)
   const adminModalities = [...new Map(events.map(event => [event.modality_id, {
     id: event.modality_id, name: event.modality
   }])).values()].sort((left, right) => left.name.localeCompare(right.name))
@@ -307,11 +392,15 @@ function App() {
     {organizer && screen === 'admin' && <main className="page wide">
       <div className="admin-heading"><div><p className="eyebrow">Organização da tribo</p><h1>Eventos</h1></div><button className="button primary" onClick={() => {setPreferredModalityId('');setScreen('create-event')}}><Icon name="plus" /> Criar evento</button></div>
       <div className="admin-shortcuts"><button onClick={() => setScreen('people')}><Icon name="person" /> Pessoas</button><button onClick={() => setScreen('history')}><Icon name="list" /> Histórico de ações</button><button onClick={() => openModalityManager()}><Icon name="list" /> Modalidades</button>{user.role === 'owner' && <button onClick={() => setScreen('organizers')}><Icon name="fire" /> Organizadores</button>}</div>
-      <ModalityChips modalities={adminModalities} selected={filter} onSelect={setFilter} label="Filtrar eventos por modalidade" />
+      <div className="admin-modality-controls"><ModalityChips modalities={adminModalities} selected={filter} onSelect={setFilter} label="Filtrar eventos por modalidade" />
+        {filter !== 'all' && <div className="report-controls">
+          <ReportButton disabled={!reportableCounts[filter]} loading={exportingModalityId === filter} onClick={() => void exportModalityReport(filter)} />
+        </div>}
+      </div>
       {visibleAdminEvents.length ? <div className="admin-events">{visibleAdminEvents.map(event => <EventCard key={event.id} event={event} onOpen={() => void openEvent(event)} onJoin={() => {}} onEdit={() => { setPreferredModalityId(''); setEditingEvent(event); setScreen('edit-event') }} admin />)}</div> : <EmptyState title={events.length ? 'Nenhum evento nesta modalidade.' : 'Ainda não há eventos.'} text={events.length ? 'Escolha outra modalidade ou volte para Todos.' : 'Crie o primeiro evento da Ethos Tribo.'} action={events.length ? undefined : <button className="button primary" onClick={() => {setPreferredModalityId('');setScreen('create-event')}}>Criar evento</button>} />}
     </main>}
 
-    {organizer && screen === 'modalities' && <main className="page wide"><button className="back-button" onClick={closeModalityManager}><Icon name="back" /> Voltar {modalityReturnScreen ? 'ao evento' : 'aos eventos'}</button><div className="page-heading"><p className="eyebrow">Organização da tribo</p><h1>Gerenciar modalidades</h1><p className="subheading">Crie, renomeie, arquive ou organize as modalidades associadas aos eventos.</p></div><ModalityManager modalities={modalities} isOwner={user.role === 'owner'} onPreview={name => api<ModalityPreview>(`/admin/modalities/preview?name=${encodeURIComponent(name)}`)} onCreate={createModality} onUse={useModality} onRename={(id,name) => handle(() => api(`/admin/modalities/${id}`, {method:'PATCH',body:{name}}), 'Modalidade renomeada.')} onToggle={(id,archived) => handle(() => api(`/admin/modalities/${id}/status`, {method:'PATCH',body:{archived}}), archived ? 'Modalidade arquivada.' : 'Modalidade reativada.')} onMerge={(id,targetId) => handle(() => api(`/admin/modalities/${id}/merge`, {method:'POST',body:{target_id:targetId}}), 'Modalidades mescladas.')} onDelete={id => handle(() => api(`/admin/modalities/${id}`, {method:'DELETE'}), 'Modalidade excluída.')} /></main>}
+    {organizer && screen === 'modalities' && <main className="page wide"><button className="back-button" onClick={closeModalityManager}><Icon name="back" /> Voltar {modalityReturnScreen ? 'ao evento' : 'aos eventos'}</button><div className="page-heading"><p className="eyebrow">Organização da tribo</p><h1>Gerenciar modalidades</h1><p className="subheading">Crie, renomeie, arquive ou organize as modalidades associadas aos eventos.</p></div><ModalityManager modalities={modalities} reportableCounts={reportableCounts} exportingModalityId={exportingModalityId} onExport={exportModalityReport} isOwner={user.role === 'owner'} onPreview={name => api<ModalityPreview>(`/admin/modalities/preview?name=${encodeURIComponent(name)}`)} onCreate={createModality} onUse={useModality} onRename={(id,name) => handle(() => api(`/admin/modalities/${id}`, {method:'PATCH',body:{name}}), 'Modalidade renomeada.')} onToggle={(id,archived) => handle(() => api(`/admin/modalities/${id}/status`, {method:'PATCH',body:{archived}}), archived ? 'Modalidade arquivada.' : 'Modalidade reativada.')} onMerge={(id,targetId) => handle(() => api(`/admin/modalities/${id}/merge`, {method:'POST',body:{target_id:targetId}}), 'Modalidades mescladas.')} onDelete={id => handle(() => api(`/admin/modalities/${id}`, {method:'DELETE'}), 'Modalidade excluída.')} /></main>}
 
     {organizer && (screen === 'create-event' || (screen === 'modalities' && modalityReturnScreen === 'create-event')) && <main className="page wide" hidden={screen === 'modalities'}><button className="back-button" onClick={() => setScreen('admin')}><Icon name="back" /> Voltar aos eventos</button><EventForm modalities={modalities} preferredModalityId={preferredModalityId} onManageModalities={() => openModalityManager('create-event')} onSubmit={async data => { if(await handle(() => api('/admin/events', { method: 'POST', body: data }), 'Evento publicado!')) setScreen('admin') }} /></main>}
     {organizer && editingEvent && (screen === 'edit-event' || (screen === 'modalities' && modalityReturnScreen === 'edit-event')) && <main className="page wide" hidden={screen === 'modalities'}><button className="back-button" onClick={() => setScreen('admin')}><Icon name="back" /> Voltar aos eventos</button><EventForm key={editingEvent.id} initial={editingEvent} modalities={modalities} preferredModalityId={preferredModalityId} onManageModalities={() => openModalityManager('edit-event')} onSubmit={async data => { if(await handle(() => api(`/admin/occurrences/${editingEvent.id}`, { method:'PATCH', body: data }), 'Evento atualizado!')) { setEditingEvent(null); setScreen('admin') } }} /></main>}
@@ -446,7 +535,16 @@ function ModalityChips({modalities,selected,onSelect,label}:{modalities:Pick<Mod
   </div>
 }
 
-function ModalityManager({modalities,isOwner,onPreview,onCreate,onUse,onRename,onToggle,onMerge,onDelete}:{modalities:Modality[];isOwner:boolean;onPreview:(name:string)=>Promise<ModalityPreview>;onCreate:(name:string)=>Promise<{modality:Modality;created:boolean}>;onUse:(modality:Modality)=>Promise<Modality>;onRename:(id:string,name:string)=>Promise<boolean>;onToggle:(id:string,archived:boolean)=>Promise<boolean>;onMerge:(id:string,targetId:string)=>Promise<boolean>;onDelete:(id:string)=>Promise<boolean>}) {
+function ReportButton({disabled,loading,onClick}:{disabled:boolean;loading:boolean;onClick:()=>void}) {
+  const tooltip = disabled ? 'Sem eventos para exportar' : undefined
+  return <span className="report-button-wrapper" title={tooltip}>
+    <button type="button" className="button secondary small report-button" disabled={disabled||loading} onClick={onClick} title={tooltip}>
+      {loading?'Gerando…':'Baixar Excel'}
+    </button>
+  </span>
+}
+
+function ModalityManager({modalities,reportableCounts,exportingModalityId,onExport,isOwner,onPreview,onCreate,onUse,onRename,onToggle,onMerge,onDelete}:{modalities:Modality[];reportableCounts:Record<string,number>;exportingModalityId:string;onExport:(id:string)=>Promise<void>;isOwner:boolean;onPreview:(name:string)=>Promise<ModalityPreview>;onCreate:(name:string)=>Promise<{modality:Modality;created:boolean}>;onUse:(modality:Modality)=>Promise<Modality>;onRename:(id:string,name:string)=>Promise<boolean>;onToggle:(id:string,archived:boolean)=>Promise<boolean>;onMerge:(id:string,targetId:string)=>Promise<boolean>;onDelete:(id:string)=>Promise<boolean>}) {
   const [renamingId,setRenamingId]=useState('')
   const [name,setName]=useState('')
   const [targets,setTargets]=useState<Record<string,string>>({})
@@ -505,6 +603,7 @@ function ModalityManager({modalities,isOwner,onPreview,onCreate,onUse,onRename,o
         ? <form className="modality-rename-form" onSubmit={async event=>{event.preventDefault();if(await onRename(modality.id,name))setRenamingId('')}}><label>Novo nome<input value={name} onChange={event=>setName(event.target.value)} minLength={2} maxLength={80} required /></label><div className="button-row"><button className="button primary small">Salvar nome</button><button type="button" className="button secondary small" onClick={()=>setRenamingId('')}>Cancelar</button></div></form>
         : <div className="modality-actions">
           <button className="button secondary small" onClick={()=>{setRenamingId(modality.id);setName(modality.name)}}>Renomear</button>
+          <ReportButton disabled={!reportableCounts[modality.id]} loading={exportingModalityId===modality.id} onClick={()=>void onExport(modality.id)} />
           <button className="button secondary small" onClick={()=>void onToggle(modality.id,!modality.archived_at)}>{modality.archived_at?'Reativar':'Arquivar'}</button>
           {isOwner&&Boolean(modality.event_count)&&<div className="modality-merge"><label>Mesclar em<select value={targets[modality.id]||''} onChange={event=>setTargets(current=>({...current,[modality.id]:event.target.value}))}><option value="">Escolher destino ativo</option>{modalities.filter(target=>target.id!==modality.id&&!target.archived_at).map(target=><option key={target.id} value={target.id}>{target.name}</option>)}</select></label><button className="button secondary small" disabled={!targets[modality.id]} onClick={()=>{const target=modalities.find(item=>item.id===targets[modality.id]);if(target&&confirm(`Mesclar “${modality.name}” em “${target.name}” moverá ${modality.event_count} ${(modality.event_count||0)===1?'evento':'eventos'}. A origem será arquivada. Continuar?`))void onMerge(modality.id,target.id).then(ok=>{if(ok)setTargets(current=>({...current,[modality.id]:''}))})}}>Mesclar</button></div>}
           {isOwner&&!modality.event_count&&<button className="button danger small" onClick={()=>{if(confirm(`Excluir a modalidade sem eventos “${modality.name}”?`))void onDelete(modality.id)}}>Excluir</button>}
@@ -566,6 +665,6 @@ function Profile({user,onSaveName,onChangePin,onLogout}:{user:User;onSaveName:(n
 
 function SettingsForm({initial,onSave}:{initial:{whatsapp:string;defaultPix:string};onSave:(settings:{whatsapp:string;defaultPix:string})=>Promise<void>}) {const [whatsapp,setWhatsapp]=useState(initial.whatsapp);const[defaultPix,setDefaultPix]=useState(initial.defaultPix);useEffect(()=>{setWhatsapp(initial.whatsapp);setDefaultPix(initial.defaultPix)},[initial.whatsapp,initial.defaultPix]);return <form className="form-stack settings" onSubmit={e=>{e.preventDefault();void onSave({whatsapp,defaultPix})}}><h2 className="section-title">Configurações da comunidade</h2><label>WhatsApp do owner (DDI + DDD)<input value={whatsapp} onChange={e=>setWhatsapp(e.target.value)} placeholder="5511999999999" inputMode="tel" /></label><label>Chave Pix padrão<input value={defaultPix} onChange={e=>setDefaultPix(e.target.value)} placeholder="Usada quando o evento não informa outra chave" /></label><button className="button secondary">Salvar configurações</button></form>}
 function Modal({title,children,onClose}:{title:string;children:React.ReactNode;onClose:()=>void}) {return <div className="modal-backdrop" role="presentation" onMouseDown={e=>{if(e.target===e.currentTarget)onClose()}}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"><button className="modal-close" onClick={onClose} aria-label="Fechar"><Icon name="close"/></button><h2 id="modal-title">{title}</h2>{children}</section></div>}
-function auditLabel(action:string) {const labels:Record<string,string>={mark_paid:'Pagamento confirmado',mark_pending:'Pagamento desfeito',remove_registration:'Inscrição removida',reset_pin:'PIN redefinido',remove_person:'Pessoa removida',create_event:'Evento criado',close_event_series:'Série encerrada',invite_organizer:'Organizador convidado',cancel_invitation:'Convite cancelado',remove_organizer:'Acesso de organizador removido',promote_waitlist:'Pessoa promovida da espera',create_modality:'Modalidade criada',rename_modality:'Modalidade renomeada',archive_modality:'Modalidade arquivada',reactivate_modality:'Modalidade reativada',merge_modalities:'Modalidades mescladas',delete_modality:'Modalidade excluída'};return labels[action]||action.replaceAll('_',' ')}
+function auditLabel(action:string) {const labels:Record<string,string>={mark_paid:'Pagamento confirmado',mark_pending:'Pagamento desfeito',remove_registration:'Inscrição removida',reset_pin:'PIN redefinido',remove_person:'Pessoa removida',create_event:'Evento criado',close_event_series:'Série encerrada',export_modality_report:'Relatório de pagamentos exportado',invite_organizer:'Organizador convidado',cancel_invitation:'Convite cancelado',remove_organizer:'Acesso de organizador removido',promote_waitlist:'Pessoa promovida da espera',create_modality:'Modalidade criada',rename_modality:'Modalidade renomeada',archive_modality:'Modalidade arquivada',reactivate_modality:'Modalidade reativada',merge_modalities:'Modalidades mescladas',delete_modality:'Modalidade excluída'};return labels[action]||action.replaceAll('_',' ')}
 
 createRoot(document.getElementById('root')!).render(<React.StrictMode><App /></React.StrictMode>)

@@ -13,6 +13,7 @@ const production = process.env.NODE_ENV === 'production'
 const appUrl = process.env.APP_URL || 'http://localhost:5173'
 const configuredOrigin = production ? '' : new URL(appUrl).origin
 const SESSION_DAYS = 365
+const REPORT_WARNING_THRESHOLD = 5000
 function requestPath(req) {
   const route = req.route?.path
   if (route) return `${req.baseUrl}${Array.isArray(route) ? route[0] : route}`
@@ -454,6 +455,15 @@ async function registrationsByOccurrence(occurrenceIds) {
     .in('occurrence_id', occurrenceIds))
 }
 
+async function reportPages(queryForPage) {
+  const rows = []
+  for (let offset = 0; ; offset += 1000) {
+    const page = await result(queryForPage().range(offset, offset + 999))
+    rows.push(...page)
+    if (page.length < 1000) return rows
+  }
+}
+
 async function occurrenceDetailQuery(req, queryName, query) {
   try {
     return await query
@@ -498,6 +508,75 @@ app.get('/api/admin/modalities', auth, requireOrganizer, wrap(async (_req, res) 
   res.json({ modalities: rows.map(({ events, ...modality }) => ({
     ...modality, event_count: events?.[0]?.count ?? 0
   })) })
+}))
+
+app.get('/api/admin/modalities/:id/report.xlsx', auth, requireOrganizer, wrap(async (req, res) => {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(req.params.id)) {
+    return fail(res, 422, 'Modalidade inválida.')
+  }
+  const modality = await result(supabase.from('modalities')
+    .select('id,name').eq('id', req.params.id).maybeSingle())
+  if (!modality) return fail(res, 404, 'Modalidade não encontrada.')
+
+  const todayStart = dateAtLocalTime(localDate(), '00:00').toISOString()
+  const generatedAt = new Date()
+  const occurrences = await reportPages(() => supabase.from('occurrences')
+    .select('id,starts_at,ends_at,seats,price_cents,event:events!inner(name,modality_id,active)')
+    .eq('event.modality_id', modality.id)
+    .eq('event.active', true)
+    .eq('open', true)
+    .gte('starts_at', todayStart)
+    .gt('ends_at', generatedAt.toISOString())
+    .order('starts_at', { ascending: true })
+    .order('id', { ascending: true }))
+  if (!occurrences.length) return fail(res, 404, 'Não há eventos elegíveis para exportar.', 'REPORT_NO_OCCURRENCES')
+
+  const occurrenceIds = occurrences.map(occurrence => occurrence.id)
+  const registrations = []
+  for (let offset = 0; offset < occurrenceIds.length; offset += 100) {
+    const occurrenceBatch = occurrenceIds.slice(offset, offset + 100)
+    registrations.push(...await reportPages(() => supabase.from('registrations')
+      .select('occurrence_id,situation,payment,wait_position,created_at,paid_at,person:people!inner(name,phone)')
+      .in('occurrence_id', occurrenceBatch)
+      .order('created_at', { ascending: true })
+      .order('id', { ascending: true })))
+  }
+  const registrationsById = new Map(occurrenceIds.map(id => [id, []]))
+  for (const registration of registrations) {
+    registrationsById.get(registration.occurrence_id).push(registration)
+  }
+  const reportOccurrences = occurrences.map(({ event, ...occurrence }) => ({
+    ...occurrence,
+    event,
+    registrations: registrationsById.get(occurrence.id)
+  }))
+  const registrationCount = registrations.length
+  const largeReport = registrationCount >= REPORT_WARNING_THRESHOLD
+  if (largeReport) {
+    logRequest(req, 'modality.report.large', {
+      occurrenceCount: occurrences.length,
+      registrationCount
+    }, 'warn')
+  }
+  const { generateModalityReport } = await import('./modality-report.js')
+  const workbook = await generateModalityReport({
+    modality,
+    occurrences: reportOccurrences,
+    generatedAt
+  })
+  await recordAudit('organizer', req.user.id, 'export_modality_report', 'modality', modality.id, {
+    name: modality.name,
+    occurrence_count: String(occurrences.length),
+    registration_count: String(registrationCount)
+  })
+
+  const slug = modality.name.normalize('NFD').replace(/\p{Diacritic}/gu, '')
+    .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'modalidade'
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+  res.setHeader('Content-Disposition', `attachment; filename="ethos-${slug}-${localDate()}.xlsx"`)
+  res.setHeader('Cache-Control', 'private, no-store')
+  if (largeReport) res.setHeader('X-Report-Warning', 'large')
+  res.send(workbook)
 }))
 
 app.get('/api/admin/modalities/preview', auth, requireOrganizer, wrap(async (req, res) => {

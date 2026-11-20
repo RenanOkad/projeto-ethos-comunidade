@@ -118,6 +118,38 @@ async function request(baseUrl, method, path, body, cookie) {
   return { ok: true, status: response.status, payload, requestId, response }
 }
 
+async function requestXlsx(baseUrl, path, cookie) {
+  const url = new URL(path, baseUrl)
+  let response
+  try {
+    response = await fetch(url, {
+      method: 'GET',
+      headers: appHeaders(cookie),
+      redirect: 'manual',
+      signal: AbortSignal.timeout(15000)
+    })
+  } catch {
+    return { ok: false, message: `GET ${path}: conexão falhou` }
+  }
+  const requestId = response.headers.get('x-request-id')
+  const contentType = response.headers.get('content-type') || ''
+  if (response.status >= 500) {
+    return { ok: false, message: `GET ${path}: HTTP ${response.status}, erro do servidor, requestId ${requestId || 'ausente'}` }
+  }
+  if (response.status !== 200 || !/^application\/vnd\.openxmlformats-officedocument\.spreadsheetml\.sheet(?:\s*;|$)/i.test(contentType)) {
+    const payload = await response.json().catch(() => null)
+    return {
+      ok: false,
+      message: `GET ${path}: HTTP ${response.status}, content-type ${contentType || 'ausente'}, erro ${payload?.error?.code || 'sem código'}, requestId ${requestId || 'ausente'}`
+    }
+  }
+  const bytes = new Uint8Array(await response.arrayBuffer())
+  if (bytes[0] !== 0x50 || bytes[1] !== 0x4b || !requestId) {
+    return { ok: false, message: `GET ${path}: arquivo XLSX inválido ou requestId ausente` }
+  }
+  return { ok: true, requestId }
+}
+
 async function checkRoute(baseUrl, [method, path, body], expectedRoute404 = false, expectedMethodNotAllowed = false) {
   const result = await request(baseUrl, method, path, body)
   if (!result.ok) return result
@@ -222,6 +254,18 @@ async function credentialedFlow(baseUrl) {
     'Carregamento inicial do detalhe'
   ).payload
   console.log('PASS GET detalhe: ocorrência existente alcançada pelo participante')
+
+  const modalityId = initialDetail.occurrence?.modality_id
+  if (!modalityId) throw new Error('Fixture inválido: o detalhe não retornou a modalidade da ocorrência.')
+  const reportPath = `/api/admin/modalities/${modalityId}/report.xlsx`
+  requireStatus(
+    await request(baseUrl, 'GET', reportPath, undefined, personCookie),
+    [403],
+    'Negação do relatório para participante'
+  )
+  const report = await requestXlsx(baseUrl, reportPath, organizerCookie)
+  if (!report.ok) throw new Error(`Relatório XLSX do organizador: ${report.message}`)
+  console.log(`PASS GET relatório XLSX: HTTP 200, content-type XLSX, requestId ${report.requestId}`)
 
   const missingOccurrence = await request(
     baseUrl,
@@ -370,6 +414,15 @@ async function main() {
     console.log(`${result.ok ? 'PASS' : 'FAIL'} ${result.message}`)
     if (!result.ok) routeFailures++
   }
+
+  const unauthenticatedReport = await request(
+    baseUrl,
+    'GET',
+    `/api/admin/modalities/${resourceId}/report.xlsx`
+  )
+  const reportAuthOk = unauthenticatedReport.ok && [401, 403].includes(unauthenticatedReport.status)
+  console.log(`${reportAuthOk ? 'PASS' : 'FAIL'} GET relatório XLSX sem sessão: ${unauthenticatedReport.status || 'sem resposta'}, requestId ${unauthenticatedReport.requestId || 'ausente'}`)
+  if (!reportAuthOk) routeFailures++
 
   const unknown = await checkRoute(baseUrl, ['GET', '/api/__smoke_route_that_does_not_exist__'], true)
   console.log(`${unknown.ok ? 'PASS' : 'FAIL'} ${unknown.message}`)
