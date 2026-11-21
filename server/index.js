@@ -579,6 +579,57 @@ app.get('/api/admin/modalities/:id/report.xlsx', auth, requireOrganizer, wrap(as
   res.send(workbook)
 }))
 
+app.get('/api/admin/occurrences/:id/report.xlsx', auth, requireOrganizer, wrap(async (req, res) => {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(req.params.id)) {
+    return fail(res, 422, 'Evento inválido.')
+  }
+  const generatedAt = new Date()
+  const occurrenceRow = await result(supabase.from('occurrences')
+    .select('id,starts_at,ends_at,seats,price_cents,events!inner(id,name,modality_id,active,modalities!inner(id,name))')
+    .eq('id', req.params.id)
+    .eq('events.active', true)
+    .eq('open', true)
+    .gte('starts_at', dateAtLocalTime(localDate(), '00:00').toISOString())
+    .gt('ends_at', generatedAt.toISOString())
+    .maybeSingle())
+  if (!occurrenceRow) return fail(res, 404, 'Este evento não está elegível para exportação.', 'REPORT_NO_OCCURRENCES')
+
+  const { events: event, ...occurrence } = occurrenceRow
+  const registrations = await reportPages(() => supabase.from('registrations')
+    .select('occurrence_id,situation,payment,wait_position,created_at,paid_at,person:people!inner(name,phone)')
+    .eq('occurrence_id', occurrence.id)
+    .order('created_at', { ascending: true })
+    .order('id', { ascending: true }))
+  const modality = { id: event.modalities.id, name: event.modalities.name }
+  const occurrenceCount = registrations.length
+  const largeReport = occurrenceCount >= REPORT_WARNING_THRESHOLD
+  if (largeReport) {
+    logRequest(req, 'occurrence.report.large', {
+      occurrenceCount: 1,
+      registrationCount: occurrenceCount
+    }, 'warn')
+  }
+  const { generateModalityReport } = await import('./modality-report.js')
+  const workbook = await generateModalityReport({
+    modality,
+    occurrences: [{ ...occurrence, event, registrations }],
+    generatedAt
+  })
+  await recordAudit('organizer', req.user.id, 'export_occurrence_report', 'occurrence', occurrence.id, {
+    name: event.name,
+    modality: modality.name,
+    registration_count: String(occurrenceCount)
+  })
+
+  const slug = event.name.normalize('NFD').replace(/\p{Diacritic}/gu, '')
+    .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'evento'
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+  res.setHeader('Content-Disposition', `attachment; filename="ethos-${slug}-${localDate()}.xlsx"`)
+  res.setHeader('Cache-Control', 'private, no-store')
+  if (largeReport) res.setHeader('X-Report-Warning', 'large')
+  res.send(workbook)
+}))
+
 app.get('/api/admin/modalities/preview', auth, requireOrganizer, wrap(async (req, res) => {
   if (!isValidModalityName(req.query.name)) {
     return fail(res, 400, 'Use de 2 a 80 letras, números, espaços ou hífens.')
@@ -715,7 +766,7 @@ app.get('/api/my-registrations', auth, requirePerson, wrap(async (req, res) => {
 
 app.get('/api/occurrences/:id', auth, wrap(async (req, res) => {
   const occurrence = await occurrenceDetailQuery(req, 'occurrence_with_event_and_modality',
-    result(supabase.from('occurrences').select('*,events!inner(name,modality_id,type,modalities!inner(id,name,slug,archived_at))')
+    result(supabase.from('occurrences').select('*,events!inner(name,modality_id,type,active,modalities!inner(id,name,slug,archived_at))')
       .eq('id', req.params.id).maybeSingle()))
   if (!occurrence) return fail(res, 404, 'Este evento não foi encontrado.')
   const { events: event, ...row } = occurrence
@@ -750,7 +801,7 @@ app.get('/api/occurrences/:id', auth, wrap(async (req, res) => {
     occurrence: {
       ...row, name: event.name, modality_id: event.modality_id,
       modality: event.modalities.name, modality_archived_at: event.modalities.archived_at,
-      type: event.type
+      type: event.type, series_active: event.active
     },
     registrations: rows,
     closedForJoin: new Date(row.starts_at).getTime() - Date.now() <= row.cutoff_hours * 3600000,

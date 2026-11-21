@@ -25,6 +25,7 @@ const routes = [
   ['PATCH', '/api/profile/pin', {}],
   ['GET', '/api/admin/events'],
   ['POST', '/api/admin/events', {}],
+  ['GET', `/api/admin/occurrences/${resourceId}/report.xlsx`],
   ['PATCH', `/api/admin/occurrences/${occurrenceId}`, {}],
   ['PATCH', `/api/admin/events/${resourceId}/close`, {}],
   ['PATCH', `/api/admin/registrations/${resourceId}/payment`, {}],
@@ -266,6 +267,15 @@ async function credentialedFlow(baseUrl) {
   const report = await requestXlsx(baseUrl, reportPath, organizerCookie)
   if (!report.ok) throw new Error(`Relatório XLSX do organizador: ${report.message}`)
   console.log(`PASS GET relatório XLSX: HTTP 200, content-type XLSX, requestId ${report.requestId}`)
+  const occurrenceReportPath = `/api/admin/occurrences/${process.env.SMOKE_OCCURRENCE_ID}/report.xlsx`
+  requireStatus(
+    await request(baseUrl, 'GET', occurrenceReportPath, undefined, personCookie),
+    [403],
+    'Negação do relatório do evento para participante'
+  )
+  const occurrenceReport = await requestXlsx(baseUrl, occurrenceReportPath, organizerCookie)
+  if (!occurrenceReport.ok) throw new Error(`Relatório XLSX do evento para organizador: ${occurrenceReport.message}`)
+  console.log(`PASS GET relatório XLSX do evento: HTTP 200, content-type XLSX, requestId ${occurrenceReport.requestId}`)
 
   const missingOccurrence = await request(
     baseUrl,

@@ -124,6 +124,7 @@ input[readonly] { color: var(--tinta-2); background: #f7f6f1; }
 .detail-hero .tag { margin-bottom: 13px; }
 .detail-hero h1 { margin-bottom: 5px; font-size: 24px; }
 .detail-hero .subheading { color: #ecf1e7; }
+.detail-report-action { display: flex; justify-content: flex-end; padding: 12px 0 0; }
 .detail-facts { display: grid; gap: 12px; padding: 17px 3px; }
 .detail-facts > div { display: flex; align-items: center; gap: 10px; color: var(--tinta-2); font-size: 14px; }
 .detail-facts .icon { color: var(--verde); }

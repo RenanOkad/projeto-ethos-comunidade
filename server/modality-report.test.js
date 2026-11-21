@@ -60,6 +60,7 @@ async function loadReport(occurrences) {
 
 test('workbook reports local dates, payment counts, waitlist, and literal text phones', async () => {
   const workbook = await loadReport([occurrence({ registrations })])
+  assert.equal(workbook.worksheets.length, 1)
   const worksheet = workbook.worksheets[0]
 
   assert.equal(worksheet.getCell('A2').value, 'Relatório gerado em: 20/11/2026 10:30')

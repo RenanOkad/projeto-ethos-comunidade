@@ -14,6 +14,7 @@ type EventItem = {
   occurrence_id?: string; notice_seen?: number
   weekday?: number; start_time?: string; end_time?: string
   open?: boolean
+  series_active?: boolean
 }
 type Registration = { id: string; name: string; person_id: string; phone?: string; situation: string; payment: string; wait_position: number | null; notice_seen: number; promoted_at?: string }
 type OccurrenceDetail = { occurrence: EventItem; registrations: Registration[]; closedForJoin: boolean; ownerName: string; ownerWhatsapp: string }
@@ -94,11 +95,14 @@ function reportableOccurrenceCounts(events:EventItem[]) {
   const today = localDateInput(new Date().toISOString())
   const now = Date.now()
   return events.reduce<Record<string, number>>((counts, event) => {
-    if (event.open && localDateInput(event.starts_at) >= today && new Date(event.ends_at).getTime() > now) {
+    if (event.open && event.series_active !== false && localDateInput(event.starts_at) >= today && new Date(event.ends_at).getTime() > now) {
       counts[event.modality_id] = (counts[event.modality_id] || 0) + 1
     }
     return counts
   }, {})
+}
+function isOccurrenceReportable(event:EventItem) {
+  return Boolean(reportableOccurrenceCounts([event])[event.modality_id])
 }
 
 function Icon({ name }: { name: 'fire' | 'calendar' | 'list' | 'person' | 'arrow' | 'check' | 'empty' | 'close' | 'copy' | 'search' | 'back' | 'plus' | 'clock' | 'pin' }) {
@@ -149,7 +153,7 @@ function App() {
   const [editingEvent, setEditingEvent] = useState<EventItem | null>(null)
   const [modalityReturnScreen, setModalityReturnScreen] = useState('')
   const [preferredModalityId, setPreferredModalityId] = useState('')
-  const [exportingModalityId, setExportingModalityId] = useState('')
+  const [exportingReportKey, setExportingReportKey] = useState('')
 
   const notify = (message: string) => { setToast(message); window.setTimeout(() => setToast(''), 3500) }
   const createModality = async (name:string) => {
@@ -257,13 +261,13 @@ function App() {
     }
     catch (e) { setError(e instanceof Error ? e.message : 'Não foi possível concluir. Tente novamente.'); return false }
   }
-  async function exportModalityReport(modalityId:string) {
-    setExportingModalityId(modalityId)
+  async function downloadReport(path:string, reportKey:string) {
+    setExportingReportKey(reportKey)
     setError('')
     try {
       let response:Response
       try {
-        response = await fetch(`/api/admin/modalities/${encodeURIComponent(modalityId)}/report.xlsx`, {
+        response = await fetch(path, {
           credentials: 'same-origin'
         })
       } catch {
@@ -282,7 +286,9 @@ function App() {
           : typeof errorValue === 'object' && errorValue && typeof errorValue.message === 'string'
             ? errorValue.message : ''
         const message = code === 'REPORT_NO_OCCURRENCES'
-          ? 'Não há eventos elegíveis para exportar.'
+          ? reportKey.startsWith('occurrence:')
+            ? 'Este evento não está elegível para exportação.'
+            : 'Não há eventos elegíveis para exportar.'
           : serverMessage || (response.status === 401
             ? 'Sua sessão expirou. Entre novamente.'
             : response.status === 403
@@ -326,8 +332,14 @@ function App() {
     } catch (failure) {
       setError(failure instanceof ApiError ? failure.message : 'Não foi possível gerar o relatório. Tente novamente.')
     } finally {
-      setExportingModalityId('')
+      setExportingReportKey('')
     }
+  }
+  async function exportModalityReport(modalityId:string) {
+    return downloadReport(`/api/admin/modalities/${encodeURIComponent(modalityId)}/report.xlsx`, `modality:${modalityId}`)
+  }
+  async function exportOccurrenceReport(occurrenceId:string) {
+    return downloadReport(`/api/admin/occurrences/${encodeURIComponent(occurrenceId)}/report.xlsx`, `occurrence:${occurrenceId}`)
   }
   async function closeEventSeries() {
     if (!detail) return
@@ -383,7 +395,11 @@ function App() {
 
     {screen === 'detail' && <main className="page">
       <button className="back-button" onClick={() => setScreen(organizer ? 'admin' : 'events')}><Icon name="back" /> Voltar</button>
-      {detailLoading ? <div className="skeleton-card" /> : detailError ? <div className="alert alert-error detail-load-error" role="alert"><span>{detailError}</span>{detailCanRetry && <button className="button secondary small" onClick={() => void openEvent({id:detailOccurrenceId})}>Tentar novamente</button>}</div> : !detail ? null : <EventDetail detail={detail} user={user} onJoin={() => void handle(() => api(`/occurrences/${detail.occurrence.id}/join`, { method: 'POST' }), 'Sua inscrição foi registrada!')}
+      {detailLoading ? <div className="skeleton-card" /> : detailError ? <div className="alert alert-error detail-load-error" role="alert"><span>{detailError}</span>{detailCanRetry && <button className="button secondary small" onClick={() => void openEvent({id:detailOccurrenceId})}>Tentar novamente</button>}</div> : !detail ? null : <EventDetail detail={detail} user={user}
+        canExportReport={isOccurrenceReportable(detail.occurrence)}
+        exportingReport={exportingReportKey === `occurrence:${detail.occurrence.id}`}
+        onExportReport={() => void exportOccurrenceReport(detail.occurrence.id)}
+        onJoin={() => void handle(() => api(`/occurrences/${detail.occurrence.id}/join`, { method: 'POST' }), 'Sua inscrição foi registrada!')}
         onLeave={() => { const r = detail.registrations.find(x => x.person_id === user.id); if (r?.payment === 'paid') setModal('paid-leave'); else setModal('leave') }}
         onPayment={(r, paid) => void handle(() => api(`/admin/registrations/${r.id}/payment`, { method: 'PATCH', body: { paid } }), paid ? 'Pagamento confirmado.' : 'Pagamento atualizado.')}
         onRemove={(r) => { setSelectedId(r.id); setModal('remove-registration') }} onClose={() => void closeEventSeries()} /> }
@@ -394,13 +410,13 @@ function App() {
       <div className="admin-shortcuts"><button onClick={() => setScreen('people')}><Icon name="person" /> Pessoas</button><button onClick={() => setScreen('history')}><Icon name="list" /> Histórico de ações</button><button onClick={() => openModalityManager()}><Icon name="list" /> Modalidades</button>{user.role === 'owner' && <button onClick={() => setScreen('organizers')}><Icon name="fire" /> Organizadores</button>}</div>
       <div className="admin-modality-controls"><ModalityChips modalities={adminModalities} selected={filter} onSelect={setFilter} label="Filtrar eventos por modalidade" />
         {filter !== 'all' && <div className="report-controls">
-          <ReportButton disabled={!reportableCounts[filter]} loading={exportingModalityId === filter} onClick={() => void exportModalityReport(filter)} />
+          <ReportButton disabled={!reportableCounts[filter]} loading={exportingReportKey === `modality:${filter}`} onClick={() => void exportModalityReport(filter)} />
         </div>}
       </div>
       {visibleAdminEvents.length ? <div className="admin-events">{visibleAdminEvents.map(event => <EventCard key={event.id} event={event} onOpen={() => void openEvent(event)} onJoin={() => {}} onEdit={() => { setPreferredModalityId(''); setEditingEvent(event); setScreen('edit-event') }} admin />)}</div> : <EmptyState title={events.length ? 'Nenhum evento nesta modalidade.' : 'Ainda não há eventos.'} text={events.length ? 'Escolha outra modalidade ou volte para Todos.' : 'Crie o primeiro evento da Ethos Tribo.'} action={events.length ? undefined : <button className="button primary" onClick={() => {setPreferredModalityId('');setScreen('create-event')}}>Criar evento</button>} />}
     </main>}
 
-    {organizer && screen === 'modalities' && <main className="page wide"><button className="back-button" onClick={closeModalityManager}><Icon name="back" /> Voltar {modalityReturnScreen ? 'ao evento' : 'aos eventos'}</button><div className="page-heading"><p className="eyebrow">Organização da tribo</p><h1>Gerenciar modalidades</h1><p className="subheading">Crie, renomeie, arquive ou organize as modalidades associadas aos eventos.</p></div><ModalityManager modalities={modalities} reportableCounts={reportableCounts} exportingModalityId={exportingModalityId} onExport={exportModalityReport} isOwner={user.role === 'owner'} onPreview={name => api<ModalityPreview>(`/admin/modalities/preview?name=${encodeURIComponent(name)}`)} onCreate={createModality} onUse={useModality} onRename={(id,name) => handle(() => api(`/admin/modalities/${id}`, {method:'PATCH',body:{name}}), 'Modalidade renomeada.')} onToggle={(id,archived) => handle(() => api(`/admin/modalities/${id}/status`, {method:'PATCH',body:{archived}}), archived ? 'Modalidade arquivada.' : 'Modalidade reativada.')} onMerge={(id,targetId) => handle(() => api(`/admin/modalities/${id}/merge`, {method:'POST',body:{target_id:targetId}}), 'Modalidades mescladas.')} onDelete={id => handle(() => api(`/admin/modalities/${id}`, {method:'DELETE'}), 'Modalidade excluída.')} /></main>}
+    {organizer && screen === 'modalities' && <main className="page wide"><button className="back-button" onClick={closeModalityManager}><Icon name="back" /> Voltar {modalityReturnScreen ? 'ao evento' : 'aos eventos'}</button><div className="page-heading"><p className="eyebrow">Organização da tribo</p><h1>Gerenciar modalidades</h1><p className="subheading">Crie, renomeie, arquive ou organize as modalidades associadas aos eventos.</p></div><ModalityManager modalities={modalities} reportableCounts={reportableCounts} exportingModalityId={exportingReportKey} onExport={exportModalityReport} isOwner={user.role === 'owner'} onPreview={name => api<ModalityPreview>(`/admin/modalities/preview?name=${encodeURIComponent(name)}`)} onCreate={createModality} onUse={useModality} onRename={(id,name) => handle(() => api(`/admin/modalities/${id}`, {method:'PATCH',body:{name}}), 'Modalidade renomeada.')} onToggle={(id,archived) => handle(() => api(`/admin/modalities/${id}/status`, {method:'PATCH',body:{archived}}), archived ? 'Modalidade arquivada.' : 'Modalidade reativada.')} onMerge={(id,targetId) => handle(() => api(`/admin/modalities/${id}/merge`, {method:'POST',body:{target_id:targetId}}), 'Modalidades mescladas.')} onDelete={id => handle(() => api(`/admin/modalities/${id}`, {method:'DELETE'}), 'Modalidade excluída.')} /></main>}
 
     {organizer && (screen === 'create-event' || (screen === 'modalities' && modalityReturnScreen === 'create-event')) && <main className="page wide" hidden={screen === 'modalities'}><button className="back-button" onClick={() => setScreen('admin')}><Icon name="back" /> Voltar aos eventos</button><EventForm modalities={modalities} preferredModalityId={preferredModalityId} onManageModalities={() => openModalityManager('create-event')} onSubmit={async data => { if(await handle(() => api('/admin/events', { method: 'POST', body: data }), 'Evento publicado!')) setScreen('admin') }} /></main>}
     {organizer && editingEvent && (screen === 'edit-event' || (screen === 'modalities' && modalityReturnScreen === 'edit-event')) && <main className="page wide" hidden={screen === 'modalities'}><button className="back-button" onClick={() => setScreen('admin')}><Icon name="back" /> Voltar aos eventos</button><EventForm key={editingEvent.id} initial={editingEvent} modalities={modalities} preferredModalityId={preferredModalityId} onManageModalities={() => openModalityManager('edit-event')} onSubmit={async data => { if(await handle(() => api(`/admin/occurrences/${editingEvent.id}`, { method:'PATCH', body: data }), 'Evento atualizado!')) { setEditingEvent(null); setScreen('admin') } }} /></main>}
@@ -504,7 +520,7 @@ function Badge({ type, children }: {type:'paid'|'pending'|'wait';children:React.
 }
 function EmptyState({ title, text, action }: { title:string;text:string;action?:React.ReactNode }) { return <div className="empty-state"><div className="empty-icon"><Icon name="fire" /></div><h2>{title}</h2><p>{text}</p>{action}</div> }
 
-function EventDetail({detail,user,onJoin,onLeave,onPayment,onRemove,onClose}:{detail:OccurrenceDetail;user:User;onJoin:()=>void;onLeave:()=>void;onPayment:(r:Registration,p:boolean)=>void;onRemove:(r:Registration)=>void;onClose:()=>void}) {
+function EventDetail({detail,user,canExportReport,exportingReport,onExportReport,onJoin,onLeave,onPayment,onRemove,onClose}:{detail:OccurrenceDetail;user:User;canExportReport:boolean;exportingReport:boolean;onExportReport:()=>void;onJoin:()=>void;onLeave:()=>void;onPayment:(r:Registration,p:boolean)=>void;onRemove:(r:Registration)=>void;onClose:()=>void}) {
   const {occurrence:event,registrations}=detail
   const people=registrations.filter(r=>r.situation==='confirmed')
   const wait=registrations.filter(r=>r.situation==='waitlist')
@@ -516,6 +532,7 @@ function EventDetail({detail,user,onJoin,onLeave,onPayment,onRemove,onClose}:{de
   const canChange=!detail.closedForJoin
   return <div className="detail-view">
     <div className="detail-hero"><span className="tag">{event.type==='recorrente'?'Semanal':'Sazonal'}</span><h1>{event.name}</h1><p className="subheading">{event.modality}</p></div>
+    {user.kind==='organizer'&&<div className="detail-report-action"><ReportButton disabled={!canExportReport} loading={exportingReport} onClick={onExportReport} /></div>}
     <div className="detail-facts"><div><Icon name="calendar" /><span>{formatDate(event.starts_at)}<br/><strong>{timeRange(event)}</strong></span></div><div><Icon name="pin" /><span>{event.location||'Local a combinar'}</span></div></div>
     <section className="pix-card"><div><span className="eyebrow">Contribuição</span><strong>{money(event.price_cents)}</strong></div><div><span className="eyebrow">Chave Pix</span><span className="pix-key">{event.pix_key||'Chave a informar pelo organizador'}</span></div>{event.pix_key&&<button className="copy-button" onClick={()=>void navigator.clipboard.writeText(event.pix_key).then(()=>alert('Chave Pix copiada.'))} aria-label="Copiar chave Pix"><Icon name="copy" /></button>}</section>
     <div className="list-summary"><div><strong>Inscritos {people.length} de {event.seats}</strong><span>{paid} pagos · {people.length-paid} pendentes</span></div>{own&&<Badge type={own.situation==='waitlist'?'wait':own.payment==='paid'?'paid':'pending'}>{own.situation==='waitlist'?`Espera · ${own.wait_position}º`:own.payment==='paid'?'Pago':'Pendente'}</Badge>}</div>
@@ -603,7 +620,7 @@ function ModalityManager({modalities,reportableCounts,exportingModalityId,onExpo
         ? <form className="modality-rename-form" onSubmit={async event=>{event.preventDefault();if(await onRename(modality.id,name))setRenamingId('')}}><label>Novo nome<input value={name} onChange={event=>setName(event.target.value)} minLength={2} maxLength={80} required /></label><div className="button-row"><button className="button primary small">Salvar nome</button><button type="button" className="button secondary small" onClick={()=>setRenamingId('')}>Cancelar</button></div></form>
         : <div className="modality-actions">
           <button className="button secondary small" onClick={()=>{setRenamingId(modality.id);setName(modality.name)}}>Renomear</button>
-          <ReportButton disabled={!reportableCounts[modality.id]} loading={exportingModalityId===modality.id} onClick={()=>void onExport(modality.id)} />
+          <ReportButton disabled={!reportableCounts[modality.id]} loading={exportingModalityId===`modality:${modality.id}`} onClick={()=>void onExport(modality.id)} />
           <button className="button secondary small" onClick={()=>void onToggle(modality.id,!modality.archived_at)}>{modality.archived_at?'Reativar':'Arquivar'}</button>
           {isOwner&&Boolean(modality.event_count)&&<div className="modality-merge"><label>Mesclar em<select value={targets[modality.id]||''} onChange={event=>setTargets(current=>({...current,[modality.id]:event.target.value}))}><option value="">Escolher destino ativo</option>{modalities.filter(target=>target.id!==modality.id&&!target.archived_at).map(target=><option key={target.id} value={target.id}>{target.name}</option>)}</select></label><button className="button secondary small" disabled={!targets[modality.id]} onClick={()=>{const target=modalities.find(item=>item.id===targets[modality.id]);if(target&&confirm(`Mesclar “${modality.name}” em “${target.name}” moverá ${modality.event_count} ${(modality.event_count||0)===1?'evento':'eventos'}. A origem será arquivada. Continuar?`))void onMerge(modality.id,target.id).then(ok=>{if(ok)setTargets(current=>({...current,[modality.id]:''}))})}}>Mesclar</button></div>}
           {isOwner&&!modality.event_count&&<button className="button danger small" onClick={()=>{if(confirm(`Excluir a modalidade sem eventos “${modality.name}”?`))void onDelete(modality.id)}}>Excluir</button>}
@@ -665,6 +682,6 @@ function Profile({user,onSaveName,onChangePin,onLogout}:{user:User;onSaveName:(n
 
 function SettingsForm({initial,onSave}:{initial:{whatsapp:string;defaultPix:string};onSave:(settings:{whatsapp:string;defaultPix:string})=>Promise<void>}) {const [whatsapp,setWhatsapp]=useState(initial.whatsapp);const[defaultPix,setDefaultPix]=useState(initial.defaultPix);useEffect(()=>{setWhatsapp(initial.whatsapp);setDefaultPix(initial.defaultPix)},[initial.whatsapp,initial.defaultPix]);return <form className="form-stack settings" onSubmit={e=>{e.preventDefault();void onSave({whatsapp,defaultPix})}}><h2 className="section-title">Configurações da comunidade</h2><label>WhatsApp do owner (DDI + DDD)<input value={whatsapp} onChange={e=>setWhatsapp(e.target.value)} placeholder="5511999999999" inputMode="tel" /></label><label>Chave Pix padrão<input value={defaultPix} onChange={e=>setDefaultPix(e.target.value)} placeholder="Usada quando o evento não informa outra chave" /></label><button className="button secondary">Salvar configurações</button></form>}
 function Modal({title,children,onClose}:{title:string;children:React.ReactNode;onClose:()=>void}) {return <div className="modal-backdrop" role="presentation" onMouseDown={e=>{if(e.target===e.currentTarget)onClose()}}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"><button className="modal-close" onClick={onClose} aria-label="Fechar"><Icon name="close"/></button><h2 id="modal-title">{title}</h2>{children}</section></div>}
-function auditLabel(action:string) {const labels:Record<string,string>={mark_paid:'Pagamento confirmado',mark_pending:'Pagamento desfeito',remove_registration:'Inscrição removida',reset_pin:'PIN redefinido',remove_person:'Pessoa removida',create_event:'Evento criado',close_event_series:'Série encerrada',export_modality_report:'Relatório de pagamentos exportado',invite_organizer:'Organizador convidado',cancel_invitation:'Convite cancelado',remove_organizer:'Acesso de organizador removido',promote_waitlist:'Pessoa promovida da espera',create_modality:'Modalidade criada',rename_modality:'Modalidade renomeada',archive_modality:'Modalidade arquivada',reactivate_modality:'Modalidade reativada',merge_modalities:'Modalidades mescladas',delete_modality:'Modalidade excluída'};return labels[action]||action.replaceAll('_',' ')}
+function auditLabel(action:string) {const labels:Record<string,string>={mark_paid:'Pagamento confirmado',mark_pending:'Pagamento desfeito',remove_registration:'Inscrição removida',reset_pin:'PIN redefinido',remove_person:'Pessoa removida',create_event:'Evento criado',close_event_series:'Série encerrada',export_modality_report:'Relatório de pagamentos exportado',export_occurrence_report:'Relatório do evento exportado',invite_organizer:'Organizador convidado',cancel_invitation:'Convite cancelado',remove_organizer:'Acesso de organizador removido',promote_waitlist:'Pessoa promovida da espera',create_modality:'Modalidade criada',rename_modality:'Modalidade renomeada',archive_modality:'Modalidade arquivada',reactivate_modality:'Modalidade reativada',merge_modalities:'Modalidades mescladas',delete_modality:'Modalidade excluída'};return labels[action]||action.replaceAll('_',' ')}
 
 createRoot(document.getElementById('root')!).render(<React.StrictMode><App /></React.StrictMode>)
