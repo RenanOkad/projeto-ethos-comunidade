@@ -464,6 +464,14 @@ async function reportPages(queryForPage) {
   }
 }
 
+async function eventCreator(eventId) {
+  const creation = await result(supabase.from('audit').select('actor_id')
+    .eq('action', 'create_event').eq('target_kind', 'event').eq('target_id', eventId)
+    .order('created_at', { ascending: true }).limit(1).maybeSingle())
+  if (!creation?.actor_id) return null
+  return result(supabase.from('organizers').select('id,name').eq('id', creation.actor_id).maybeSingle())
+}
+
 async function occurrenceDetailQuery(req, queryName, query) {
   try {
     return await query
@@ -766,7 +774,7 @@ app.get('/api/my-registrations', auth, requirePerson, wrap(async (req, res) => {
 
 app.get('/api/occurrences/:id', auth, wrap(async (req, res) => {
   const occurrence = await occurrenceDetailQuery(req, 'occurrence_with_event_and_modality',
-    result(supabase.from('occurrences').select('*,events!inner(name,modality_id,type,active,modalities!inner(id,name,slug,archived_at))')
+    result(supabase.from('occurrences').select('*,events!inner(id,name,modality_id,type,active,modalities!inner(id,name,slug,archived_at))')
       .eq('id', req.params.id).maybeSingle()))
   if (!occurrence) return fail(res, 404, 'Este evento não foi encontrado.')
   const { events: event, ...row } = occurrence
@@ -793,15 +801,19 @@ app.get('/api/occurrences/:id', auth, wrap(async (req, res) => {
   }).sort((left, right) => left.situation === right.situation
     ? (left.situation === 'confirmed' ? left.created_at.localeCompare(right.created_at) : left.wait_position - right.wait_position)
     : left.situation === 'confirmed' ? -1 : 1)
-  const [ownerName, ownerWhatsapp] = await Promise.all([
+  const [ownerName, ownerWhatsapp, creator] = await Promise.all([
     occurrenceDetailQuery(req, 'owner_name_setting', setting('owner_name')),
-    occurrenceDetailQuery(req, 'owner_whatsapp_setting', setting('owner_whatsapp'))
+    occurrenceDetailQuery(req, 'owner_whatsapp_setting', setting('owner_whatsapp')),
+    organizer
+      ? occurrenceDetailQuery(req, 'event_creator', eventCreator(event.id))
+      : Promise.resolve(null)
   ])
   res.json({
     occurrence: {
       ...row, name: event.name, modality_id: event.modality_id,
       modality: event.modalities.name, modality_archived_at: event.modalities.archived_at,
-      type: event.type, series_active: event.active
+      type: event.type, series_active: event.active,
+      ...(creator ? { created_by_name: creator.name } : {})
     },
     registrations: rows,
     closedForJoin: new Date(row.starts_at).getTime() - Date.now() <= row.cutoff_hours * 3600000,
@@ -974,12 +986,31 @@ app.patch('/api/admin/occurrences/:id', auth, requireOrganizer, wrap(async (req,
 }))
 
 app.patch('/api/admin/events/:id/close', auth, requireOrganizer, wrap(async (req, res) => {
-  const event = await result(supabase.from('events').select('id').eq('id', req.params.id).maybeSingle())
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(req.params.id)) {
+    return fail(res, 404, 'Evento não encontrado.')
+  }
+  const event = await result(supabase.from('events').select('id,name,active').eq('id', req.params.id).maybeSingle())
   if (!event) return fail(res, 404, 'Evento não encontrado.')
-  await result(supabase.from('events').update({ active: false }).eq('id', event.id))
-  await result(supabase.from('occurrences').update({ open: false }).eq('event_id', event.id).gt('starts_at', now()))
-  await recordAudit('organizer', req.user.id, 'close_event_series', 'event', event.id)
-  res.json({ ok: true })
+  const closedAt = now()
+  const futureOpenOccurrences = await result(supabase.from('occurrences').select('id')
+    .eq('event_id', event.id).eq('open', true).gt('starts_at', closedAt).limit(1))
+  if (!event.active && !futureOpenOccurrences.length) {
+    return res.json({ ok: true, alreadyClosed: true })
+  }
+
+  if (event.active) {
+    await result(supabase.from('events').update({ active: false }).eq('id', event.id))
+  }
+  if (futureOpenOccurrences.length) {
+    await result(supabase.from('occurrences').update({ open: false })
+      .eq('event_id', event.id).eq('open', true).gt('starts_at', closedAt))
+  }
+  const creator = await eventCreator(event.id)
+  await recordAudit('organizer', req.user.id, 'close_event_series', 'event', event.id, {
+    name: event.name,
+    ...(creator ? { created_by_id: creator.id, created_by_name: creator.name } : {})
+  })
+  res.json({ ok: true, alreadyClosed: false })
 }))
 
 app.patch('/api/admin/registrations/:id/payment', auth, requireOrganizer, wrap(async (req, res) => {

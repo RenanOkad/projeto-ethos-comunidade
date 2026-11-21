@@ -15,6 +15,7 @@ type EventItem = {
   weekday?: number; start_time?: string; end_time?: string
   open?: boolean
   series_active?: boolean
+  created_by_name?: string
 }
 type Registration = { id: string; name: string; person_id: string; phone?: string; situation: string; payment: string; wait_position: number | null; notice_seen: number; promoted_at?: string }
 type OccurrenceDetail = { occurrence: EventItem; registrations: Registration[]; closedForJoin: boolean; ownerName: string; ownerWhatsapp: string }
@@ -343,14 +344,17 @@ function App() {
   }
   async function closeEventSeries() {
     if (!detail) return
-    const closed = await handle(
-      () => api(`/admin/events/${detail.occurrence.event_id}/close`, { method: 'PATCH' }),
-      'Série encerrada.',
-      false
-    )
-    if (closed) {
-      await refresh()
+    const event = detail.occurrence
+    setError('')
+    try {
+      const result = await api<{ok:boolean;alreadyClosed?:boolean}>(`/admin/events/${event.event_id}/close`, { method: 'PATCH' })
+      const remainingEvents = events.filter(item => item.event_id !== event.event_id)
+      setEvents(remainingEvents)
+      if (filter !== 'all' && !remainingEvents.some(item => item.modality_id === filter)) setFilter('all')
       setScreen('admin')
+      notify(result.alreadyClosed ? 'Este evento já estava encerrado.' : 'Série encerrada.')
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : 'Não foi possível encerrar este evento. Tente novamente.')
     }
   }
   async function logout() { await api('/logout', { method: 'POST' }); setUser(null); setScreen('events'); setEvents([]); setMine([]) }
@@ -423,7 +427,7 @@ function App() {
 
     {organizer && screen === 'people' && <main className="page wide"><button className="back-button" onClick={() => setScreen('admin')}><Icon name="back" /> Voltar ao painel</button><div className="page-heading"><p className="eyebrow">Comunidade</p><h1>Pessoas</h1><p className="subheading">Os telefones aparecem apenas para organizadores.</p></div><label className="search-field"><Icon name="search" /><input value={search} onChange={e => setSearch(e.target.value)} placeholder="Buscar por nome ou telefone" /></label><div className="people-list">{visiblePeople.map(person => <div className="person-row" key={person.id}><div><strong>{person.name}</strong><span>{person.phone}</span></div><div className="button-row"><button className="button secondary small" onClick={() => void handle(async () => { const result = await api<{temporaryPin:string}>(`/admin/people/${person.id}/reset-pin`, { method:'POST' }); window.alert(`PIN temporário: ${result.temporaryPin}\\nCompartilhe com cuidado; a pessoa deve escolher um novo PIN.`) }, 'PIN redefinido.')}>Redefinir PIN</button><button className="button danger small" onClick={() => { setSelectedId(person.id); setModal('remove-person') }}>Remover</button></div></div>)}</div></main>}
 
-    {organizer && screen === 'history' && <main className="page wide"><button className="back-button" onClick={() => setScreen('admin')}><Icon name="back" /> Voltar ao painel</button><div className="page-heading"><p className="eyebrow">Transparência</p><h1>Histórico de ações</h1><p className="subheading">Ações sensíveis ficam registradas para consulta dos organizadores.</p></div><div className="history-list">{history.length ? history.map(item => <article className="history-item" key={item.id}><strong>{auditLabel(item.action)}</strong><p>{item.details?.name || item.details?.email || (item.details?.source ? `${item.details.source} → ${item.details.target} (${item.details.event_count} eventos)` : item.target_kind)}</p><small>Por {item.actor_name} · {formatDate(item.created_at, { day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit' })}</small></article>) : <EmptyState title="Nenhuma ação registrada ainda." text="As ações importantes aparecerão aqui." />}</div></main>}
+    {organizer && screen === 'history' && <main className="page wide"><button className="back-button" onClick={() => setScreen('admin')}><Icon name="back" /> Voltar ao painel</button><div className="page-heading"><p className="eyebrow">Transparência</p><h1>Histórico de ações</h1><p className="subheading">Ações sensíveis ficam registradas para consulta dos organizadores.</p></div><div className="history-list">{history.length ? history.map(item => <article className="history-item" key={item.id}><strong>{auditLabel(item.action)}</strong><p>{item.details?.name || item.details?.email || (item.details?.source ? `${item.details.source} → ${item.details.target} (${item.details.event_count} eventos)` : item.target_kind)}</p><small>Por {item.actor_name} · {formatDate(item.created_at, { day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit' })}</small>{item.action === 'close_event_series' && item.details?.created_by_id && item.details.created_by_id !== item.actor_id && item.details.created_by_name && <small className="history-creator">Criado por {item.details.created_by_name}</small>}</article>) : <EmptyState title="Nenhuma ação registrada ainda." text="As ações importantes aparecerão aqui." />}</div></main>}
 
     {user.role === 'owner' && screen === 'organizers' && <main className="page wide"><button className="back-button" onClick={() => setScreen('admin')}><Icon name="back" /> Voltar ao painel</button><div className="admin-heading"><div><p className="eyebrow">Acesso da equipe</p><h1>Organizadores <span className="tag">Owner</span></h1></div><button className="button primary" onClick={() => setModal('invite')}><Icon name="plus" /> Convidar</button></div><p className="info-note">Admins gerenciam eventos, pagamentos e PINs, mas não criam nem removem outros admins.</p><div className="people-list">{organizers.map(item => <div className="person-row" key={item.id}><div><strong>{item.name} {item.role === 'owner' && <span className="tag">Owner</span>}</strong><span>{item.email}</span></div>{item.role !== 'owner' && <button className="button danger small" onClick={() => void handle(() => api(`/owner/organizers/${item.id}`, { method:'DELETE' }), 'Acesso removido.')}>Remover acesso</button>}</div>)}</div><h2 className="section-title">Convites pendentes</h2>{invitations.map(invite => <div className="person-row" key={invite.id}><div><strong>{invite.email}</strong><span>Expira em {formatDate(invite.expires_at)}</span></div><div className="button-row"><button className="button secondary small" onClick={async () => { try { const result=await api<{link:string}>('/owner/invitations',{method:'POST',body:{email:invite.email}}); setInviteLink(result.link); const list=await api<{invitations:typeof invitations}>('/owner/organizers'); setInvitations(list.invitations); setModal('invite-link') } catch(e) { setError(e instanceof Error?e.message:'Não foi possível gerar outro convite.') } }}>Reenviar</button><button className="button secondary small" onClick={() => void handle(() => api(`/owner/invitations/${invite.id}`, { method:'DELETE' }), 'Convite cancelado.')}>Cancelar</button></div></div>)}<SettingsForm initial={ownerSettings} onSave={async settings => { await handle(() => api('/owner/settings', { method:'PATCH', body:settings }), 'Configurações atualizadas.') }} /><button className="text-button underlined" onClick={() => setScreen('history')}>Ver histórico de ações</button></main>}
 
@@ -541,7 +545,7 @@ function EventDetail({detail,user,canExportReport,exportingReport,onExportReport
     <div className="info-note"><strong>Inscrições e desistências até {event.cutoff_hours}h antes do início ({formatDate(cutoffTime,{weekday:'short',hour:'2-digit',minute:'2-digit'})}).</strong><br/>Fez o Pix? O organizador confirma seu pagamento e o status muda para Pago.</div>
     {participant && <div className="sticky-action">{own ? own.payment==='paid'&&own.situation==='confirmed' ? <button className="button secondary full" onClick={onLeave}>Falar com o organizador para desistir</button> : <button className="button secondary full" disabled={!canChange} onClick={onLeave}>{canChange?'Desistir da vaga':'Prazo encerrado'}</button> : <button className="button primary full" disabled={!canChange} onClick={onJoin}>{!canChange?'Inscrições encerradas':lot?'Entrar na lista de espera':'Entrar na lista'}</button>}{!canChange&&<><small>As inscrições e desistências fecharam. Fale com um organizador se precisar de ajuda.</small>{detail.ownerWhatsapp&&<a className="text-button underlined" href={`https://wa.me/${detail.ownerWhatsapp}`} target="_blank" rel="noreferrer">Falar com um organizador no WhatsApp</a>}</>}</div>}
     {!participant&&<div className="info-note">Só o organizador altera o status de pagamento. O telefone aparece apenas aqui.</div>}
-    {user.role==='owner'&&<button className="button danger full" onClick={()=>{if(confirm('Encerrar esta série? As próximas ocorrências não serão abertas.'))void onClose()}}>Encerrar série</button>}
+    {user.kind==='organizer'&&<button className="button danger full" onClick={()=>{const creator=event.created_by_name?`\nCriado por ${event.created_by_name}.`:'';if(confirm(`Encerrar “${event.name}”?${creator}\nAs próximas ocorrências não serão abertas.`))void onClose()}}>Encerrar evento</button>}
   </div>
 }
 

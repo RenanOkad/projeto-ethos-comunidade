@@ -396,6 +396,149 @@ async function credentialedFlow(baseUrl) {
   return 0
 }
 
+async function closePermissionFlow(baseUrl) {
+  const variables = [
+    'SMOKE_CLOSE_ADMIN_EMAIL',
+    'SMOKE_CLOSE_ADMIN_PASSWORD',
+    'SMOKE_CLOSE_OWNER_EMAIL',
+    'SMOKE_CLOSE_OWNER_PASSWORD',
+    'SMOKE_PERSON_PHONE',
+    'SMOKE_PERSON_PIN',
+    'SMOKE_CLOSE_OWNER_CREATED_EVENT_ID',
+    'SMOKE_CLOSE_ADMIN_CREATED_EVENT_ID',
+    'SMOKE_CLOSE_ADMIN_OWN_EVENT_ID'
+  ]
+  const missing = variables.filter(name => !process.env[name])
+  if (missing.length) {
+    console.error(`FAIL teste de encerramento: configure todas as variáveis ${variables.join(', ')}.`)
+    return 1
+  }
+  const eventIds = variables.slice(6).map(name => process.env[name])
+  if (eventIds.some(id => !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) ||
+      new Set(eventIds).size !== eventIds.length) {
+    console.error('FAIL teste de encerramento: configure três IDs UUID de eventos de teste distintos.')
+    return 1
+  }
+
+  const loginOrganizer = async (email, password, expectedRole) => {
+    const login = requireStatus(
+      await request(baseUrl, 'POST', '/api/organizer/login', { email, password }),
+      [200],
+      `Login de ${expectedRole}`
+    )
+    const cookie = sessionCookie(login.response)
+    if (!cookie || login.payload?.user?.role !== expectedRole) {
+      throw new Error(`O login de teste não retornou sessão com papel ${expectedRole}.`)
+    }
+    return { cookie, id: login.payload.user.id }
+  }
+  const admin = await loginOrganizer(
+    process.env.SMOKE_CLOSE_ADMIN_EMAIL,
+    process.env.SMOKE_CLOSE_ADMIN_PASSWORD,
+    'admin'
+  )
+  const owner = await loginOrganizer(
+    process.env.SMOKE_CLOSE_OWNER_EMAIL,
+    process.env.SMOKE_CLOSE_OWNER_PASSWORD,
+    'owner'
+  )
+  const personLogin = requireStatus(
+    await request(baseUrl, 'POST', '/api/login', {
+      phone: process.env.SMOKE_PERSON_PHONE,
+      pin: process.env.SMOKE_PERSON_PIN
+    }),
+    [200],
+    'Login de participante para teste de encerramento'
+  )
+  const personCookie = sessionCookie(personLogin.response)
+  if (!personCookie) throw new Error('Login de participante: sessão não retornada.')
+
+  const eventIdsByRole = [
+    [process.env.SMOKE_CLOSE_OWNER_CREATED_EVENT_ID, owner.id, 'criado pelo owner'],
+    [process.env.SMOKE_CLOSE_ADMIN_CREATED_EVENT_ID, admin.id, 'criado pelo admin'],
+    [process.env.SMOKE_CLOSE_ADMIN_OWN_EVENT_ID, admin.id, 'criado pelo admin para teste do criador']
+  ]
+  const audit = requireStatus(
+    await request(baseUrl, 'GET', '/api/admin/audit', undefined, admin.cookie),
+    [200],
+    'Auditoria para validar fixtures de encerramento'
+  ).payload
+  for (const [eventId, creatorId, description] of eventIdsByRole) {
+    if (!(audit.entries || []).some(entry =>
+      entry.action === 'create_event' && entry.target_id === eventId && entry.actor_id === creatorId
+    )) {
+      throw new Error(`Fixture inválido: o evento ${description} não possui registro de criação correspondente na auditoria.`)
+    }
+  }
+
+  const adminEvents = requireStatus(
+    await request(baseUrl, 'GET', '/api/admin/events', undefined, admin.cookie),
+    [200],
+    'Verificação de eventos ativos de teste'
+  ).payload.events || []
+  for (const [eventId] of eventIdsByRole) {
+    if (!adminEvents.some(event => event.event_id === eventId)) {
+      throw new Error('Fixture inválido: todos os eventos de teste devem estar ativos antes do smoke.')
+    }
+  }
+
+  const unauthenticated = await request(
+    baseUrl, 'PATCH', `/api/admin/events/${eventIdsByRole[0][0]}/close`, {}
+  )
+  requireStatus(unauthenticated, [401], 'Encerramento sem sessão')
+  const denied = await request(
+    baseUrl,
+    'PATCH',
+    `/api/admin/events/${eventIdsByRole[0][0]}/close`,
+    {},
+    personCookie
+  )
+  requireStatus(denied, [403], 'Negação de encerramento para participante')
+
+  const missingEvent = await request(
+    baseUrl,
+    'PATCH',
+    `/api/admin/events/${randomUUID()}/close`,
+    {},
+    admin.cookie
+  )
+  if (!missingEvent.ok || missingEvent.status !== 404 ||
+      missingEvent.payload?.error?.code !== 'RESOURCE_NOT_FOUND' || !missingEvent.requestId) {
+    throw new Error('Evento inexistente: esperado 404 JSON padronizado com requestId.')
+  }
+
+  const closeAs = async (cookie, id, label, expectedAlreadyClosed) => {
+    const result = await request(baseUrl, 'PATCH', `/api/admin/events/${id}/close`, {}, cookie)
+    requireStatus(result, [200], label)
+    if (result.payload?.alreadyClosed !== expectedAlreadyClosed) {
+      throw new Error(`${label}: resposta de idempotência inesperada.`)
+    }
+    return result.payload
+  }
+  await closeAs(admin.cookie, eventIdsByRole[0][0], 'Admin encerrando evento criado pelo owner', false)
+  await closeAs(owner.cookie, eventIdsByRole[0][0], 'Owner repetindo encerramento', true)
+  await closeAs(owner.cookie, eventIdsByRole[1][0], 'Owner encerrando evento criado pelo admin', false)
+  await closeAs(admin.cookie, eventIdsByRole[2][0], 'Criador original encerrando seu próprio evento', false)
+
+  const closedAudit = requireStatus(
+    await request(baseUrl, 'GET', '/api/admin/audit', undefined, owner.cookie),
+    [200],
+    'Auditoria após encerramentos de teste'
+  ).payload.entries || []
+  const crossClose = closedAudit.find(entry =>
+    entry.action === 'close_event_series' &&
+    entry.target_id === eventIdsByRole[0][0] &&
+    entry.actor_id === admin.id
+  )
+  if (!crossClose || crossClose.details?.created_by_id !== owner.id ||
+      !crossClose.details?.created_by_name) {
+    throw new Error('Auditoria de encerramento não registrou organizador executor e criador original.')
+  }
+
+  console.log('PASS encerramento: admin/owner, criador, participante, sem sessão, evento inexistente, repetição e auditoria')
+  return 0
+}
+
 async function main() {
   const input = process.argv[2]
   if (!input) {
@@ -434,6 +577,17 @@ async function main() {
   console.log(`${reportAuthOk ? 'PASS' : 'FAIL'} GET relatório XLSX sem sessão: ${unauthenticatedReport.status || 'sem resposta'}, requestId ${unauthenticatedReport.requestId || 'ausente'}`)
   if (!reportAuthOk) routeFailures++
 
+  const unauthenticatedClose = await request(
+    baseUrl,
+    'PATCH',
+    `/api/admin/events/${resourceId}/close`,
+    {}
+  )
+  const closeAuthOk = unauthenticatedClose.ok && unauthenticatedClose.status === 401 &&
+    unauthenticatedClose.payload?.error?.code === 'UNAUTHENTICATED'
+  console.log(`${closeAuthOk ? 'PASS' : 'FAIL'} PATCH encerramento sem sessão: ${unauthenticatedClose.status || 'sem resposta'}, requestId ${unauthenticatedClose.requestId || 'ausente'}`)
+  if (!closeAuthOk) routeFailures++
+
   const unknown = await checkRoute(baseUrl, ['GET', '/api/__smoke_route_that_does_not_exist__'], true)
   console.log(`${unknown.ok ? 'PASS' : 'FAIL'} ${unknown.message}`)
   if (!unknown.ok) routeFailures++
@@ -453,6 +607,16 @@ async function main() {
   } catch (error) {
     console.error(`FAIL fluxos autenticados: ${error.message}`)
     flowFailures++
+  }
+  if (process.env.SMOKE_RUN_CLOSE_TESTS === '1') {
+    try {
+      flowFailures += await closePermissionFlow(baseUrl)
+    } catch (error) {
+      console.error(`FAIL teste de encerramento: ${error.message}`)
+      flowFailures++
+    }
+  } else {
+    console.log('SKIP testes de permissão de encerramento: configure fixtures dedicados e SMOKE_RUN_CLOSE_TESTS=1.')
   }
   for (const cookie of testSessionCookies) {
     const logout = await request(baseUrl, 'POST', '/api/logout', {}, cookie)

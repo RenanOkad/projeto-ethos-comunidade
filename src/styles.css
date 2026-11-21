@@ -186,6 +186,7 @@ input[readonly] { color: var(--tinta-2); background: #f7f6f1; }
 .history-item strong { font-size: 14px; }
 .history-item p { margin: 5px 0; color: var(--tinta-2); font-size: 13px; }
 .history-item small { color: var(--tinta-2); font-size: 11px; }
+.history-item .history-creator { display: block; margin-top: 3px; }
 .modality-management-list { display: grid; gap: 12px; }
 .modality-manager-heading { align-items: flex-end; }
 .modality-manager-heading .subheading { font-size: 13px; }
